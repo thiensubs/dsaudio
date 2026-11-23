@@ -42,14 +42,16 @@ static void *job_thread(void *user) {
             j->tts.ok = true;
             j->tts.audio = cr.audio;
             snprintf(j->tts.content_type, sizeof j->tts.content_type, "%s", cr.content_type);
-            j->artifact.chunks = cr.chunks;
-            j->artifact.cached = cr.cached;
-            j->artifact.generated = cr.generated;
+            int n_chunks = cr.chunks, n_cached = cr.cached, n_made = cr.generated;
             ds_tts_chunk_result_free(&cr);
             /* Heavy work stays here, on the worker: probe the audio, reduce it
-             * to waveform peaks and write the file. */
+             * to waveform peaks and write the file. The counters are copied
+             * before the reset, or the memset below would wipe them. */
             ds_tts_artifact *art = &j->artifact;
             memset(art, 0, sizeof *art);
+            art->chunks = n_chunks;
+            art->cached = n_cached;
+            art->generated = n_made;
             ds_audio_info info;
             if (ds_audio_probe(j->tts.audio.data, j->tts.audio.len, &info)) {
                 int want = cfg.peaks > 0 ? cfg.peaks : DS_TTS_PEAKS;
