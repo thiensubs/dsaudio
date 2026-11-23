@@ -61,7 +61,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          if [[ "{{ matrix.os }}" == macos-* ]]; then
+          if [[ "${{ matrix.os }}" == macos-* ]]; then
             tar -czf dist/{{ matrix.asset }}.tar.gz -C build dsaudio.app
           else
             tar -czf dist/{{ matrix.asset }}.tar.gz -C build dsaudio
