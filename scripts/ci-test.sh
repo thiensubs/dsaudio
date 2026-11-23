@@ -11,7 +11,15 @@ BUILD="${BUILD_DIR:-build}"
 GUI="${1:-}"
 
 # Resolve the binaries: MSVC puts them in build/Release and adds .exe.
-pick() { ls "$BUILD"/$1* 2>/dev/null | head -n 1; }
+pick() {
+  # MSVC writes to build/Release and adds .exe; skip the project files.
+  local c
+  for pat in "$BUILD/Release/$1.exe" "$BUILD/$1.exe" "$BUILD/Release/$1" "$BUILD/$1"; do
+    c=$(ls $pat 2>/dev/null | head -n 1)
+    [ -n "$c" ] && { echo "$c"; return; }
+  done
+  ls "$BUILD"/$1* 2>/dev/null | rg -v '\.(vcxproj|sln|filters|user|txt|dir)$' | head -n 1
+}
 MCP="$(pick dsaudio-mcp)"
 CLI="$(pick dsaudio-cli)"
 APP="$(pick dsaudio | rg -v 'mcp|cli' || true)"
