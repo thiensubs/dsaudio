@@ -37,7 +37,6 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/microsoft/vcpkg.git "$env:RUNNER_TEMP\vcpkg"
           & "$env:RUNNER_TEMP\vcpkg\bootstrap-vcpkg.bat" | Out-Null
-          & "$env:RUNNER_TEMP\vcpkg\vcpkg.exe" install curl:x64-windows-static
           echo "CMAKE_TOOLCHAIN_FILE=$env:RUNNER_TEMP\vcpkg\scripts\buildsystems\vcpkg.cmake" >> $env:GITHUB_ENV
 
       - name: Configure and build
