@@ -94,7 +94,7 @@ jobs:
           echo "app exited $?"
 
       - name: App smoke test (headless quit)
-        if: matrix.os != 'ubuntu'
+        if: ${{ !startsWith(matrix.os, 'ubuntu') }}
         shell: bash
         run: |
           ./build/dsaudio > /dev/null 2>&1 &
