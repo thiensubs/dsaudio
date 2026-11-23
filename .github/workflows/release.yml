@@ -83,6 +83,7 @@ jobs:
 
   release:
     needs: build
+    if: always()   # macOS runners are capacity-starved; ship what landed
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8
@@ -121,6 +122,12 @@ jobs:
 
           Every archive has a SHA-256 sidecar. Linux needs libcurl and libasound at
           runtime; Windows and macOS ship everything they need.
+
+          macOS binaries are **ad-hoc signed, not notarised**. Gatekeeper will refuse
+          them on first launch: right-click the app and choose Open, or run
+          `xattr -dr com.apple.quarantine /Applications/dsaudio.app`. Signing with a
+          Developer ID and notarising is a one-line change in `scripts/make_app.sh`
+          once you have a certificate.
 
           ### Verify
 
