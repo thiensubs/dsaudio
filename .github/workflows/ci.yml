@@ -20,7 +20,9 @@ jobs:
           - { name: linux-x86_64, os: ubuntu-22.04, arch: x86_64 }
           - { name: linux-arm64, os: ubuntu-22.04-arm, arch: arm64 }
           - { name: windows-x86_64, os: windows-2022, arch: x86_64 }
-          - { name: macos-x86_64, os: macos-13, arch: x86_64 }
+          # Intel macOS is built on an arm64 runner and run under Rosetta 2:
+          # the macos-13 Intel runners are being retired and queue for ages.
+          - { name: macos-x86_64, os: macos-14, arch: x86_64 }
           - { name: macos-arm64, os: macos-14, arch: arm64 }
 
     steps:
@@ -43,7 +45,9 @@ jobs:
           echo "CMAKE_TOOLCHAIN_FILE=$env:RUNNER_TEMP\vcpkg\scripts\buildsystems\vcpkg.cmake" >> $env:GITHUB_ENV
 
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        run: >-
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch || 'arm64' }}
 
       - name: Build
         run: cmake --build build --config Release -j2
