@@ -43,6 +43,9 @@ static void *job_thread(void *user) {
             j->tts.audio = cr.audio;
             snprintf(j->tts.content_type, sizeof j->tts.content_type, "%s", cr.content_type);
             int n_chunks = cr.chunks, n_cached = cr.cached, n_made = cr.generated;
+            /* ownership moved to j->tts: detach before freeing the struct, or
+             * the shared buffer is freed twice. */
+            memset(&cr.audio, 0, sizeof cr.audio);
             ds_tts_chunk_result_free(&cr);
             /* Heavy work stays here, on the worker: probe the audio, reduce it
              * to waveform peaks and write the file. The counters are copied

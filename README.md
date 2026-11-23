@@ -23,6 +23,37 @@ Needs a C99 compiler, CMake 3.14+, libcurl development headers, and on macOS
 Xcode command line tools. Outputs `build/dsaudio`, `build/dsaudio-cli`,
 `build/dsaudio-mcp`.
 
+## Binaries and timings
+
+Measured on the 2026-11-23 build (macOS x86_64, Release, embedded fonts loaded).
+
+| Application | Binary | Size | Time |
+|---|---|---|---|
+| `dsaudio` (workbench) | `build/dsaudio` | 2,508,584 B (2.4 MiB) | 4.49 s to a visible window, cold |
+| `dsaudio-cli` | `build/dsaudio-cli` | 1,274,200 B (1.2 MiB) | 0.64 s for `config` |
+| `dsaudio-mcp` | `build/dsaudio-mcp` | 1,273,776 B (1.2 MiB) | 0.60 s for `--selftest` |
+| TTS, 2 chunks, cold cache | – | 3.49 s | 2 requests, 0 from cache |
+| TTS, same text, warm cache | – | **0.54 s** | 0 requests, no token cost |
+| TTS, one sentence edited | – | 3.49 s | 1 request, 1 chunk reused |
+| ASR, 3 s clip | – | 1.2 s | 1 request |
+
+The 4.49 s window is dominated by parsing the 1.4 MB of embedded fonts (Latin,
+Vietnamese and the CJK fallbacks). Lazy-loading the CJK subsets only when a CJK
+language is selected is the obvious next win.
+
+## Chunked TTS: edit one sentence, pay for one sentence
+
+`docs/tts-chunks-cold.png` and `docs/tts-chunks-edited.png` show the same text
+before and after an edit. The text is split at sentence boundaries, each chunk
+is cached by a hash of its text, and only the changed chunk is synthesized
+again — the join is a 12 ms equal-power crossfade.
+
+![chunk activity](docs/tts-chunk-activity.png)
+
+Measured: a 2-chunk text costs 2 requests cold, 0 requests warm, and 1 request
+after one sentence changes. That is the whole point of the cache: the second
+edit is free.
+
 ## Use
 
 ```sh
