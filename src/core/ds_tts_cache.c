@@ -9,9 +9,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <dirent.h>
 #include <sys/stat.h>
+#ifndef _WIN32
+#include <dirent.h>
 #include <unistd.h>
+#endif
 
 #define DS_CHUNK_TARGET 900     /* billed characters aimed for per chunk */
 #define DS_CHUNK_MAX 2200       /* never exceed this in one chunk */
