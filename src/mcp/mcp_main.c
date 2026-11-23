@@ -375,6 +375,29 @@ static int cmd_install(const char *prefix) {
     return 0;
 }
 
+/* Portable line reader: getline/ssize_t do not exist on MSVC. */
+static bool ds_read_line(FILE *f, char **buf, size_t *cap) {
+    if (!*buf) {
+        *cap = 1024;
+        *buf = (char *)malloc(*cap);
+        if (!*buf) return false;
+    }
+    size_t len = 0;
+    int c;
+    while ((c = fgetc(f)) != EOF && c != '\n') {
+        if (len + 2 > *cap) {
+            *cap *= 2;
+            char *nb = (char *)realloc(*buf, *cap);
+            if (!nb) return false;
+            *buf = nb;
+        }
+        (*buf)[len++] = (char)c;
+    }
+    if (c == EOF && len == 0) return false;
+    (*buf)[len] = '\0';
+    return true;
+}
+
 int main(int argc, char **argv) {
     ds_http_init();
 
@@ -403,9 +426,8 @@ int main(int argc, char **argv) {
 
     char *line = NULL;
     size_t cap = 0;
-    ssize_t n;
-    while ((n = getline(&line, &cap, stdin)) > 0) {
-        ds_json *req = ds_json_parse(line, (size_t)n);
+    while (ds_read_line(stdin, &line, &cap)) {
+        ds_json *req = ds_json_parse(line, strlen(line));
         if (!req) {
             emit_error("null", -32700, "parse error");
             continue;
