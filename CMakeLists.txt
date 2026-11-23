@@ -6,6 +6,13 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Oldest macOS this binary will run on. Without this the SDK stamps the
+# binary with its own version and older machines refuse to launch it with
+# "you can't use this version of the application".
+if(APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET 11.0)
+endif()
+
 # Vendored UI library. Examples and tests are not needed by this app.
 set(CUI_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(CUI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
