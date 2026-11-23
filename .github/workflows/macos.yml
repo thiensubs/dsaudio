@@ -1,12 +1,16 @@
 name: macos
 
-# macOS runners are capacity-starved: a queued leg there blocks a shared matrix
-# for tens of minutes. This workflow is therefore separate and on demand —
-# run it by hand when you want the macOS slices, or on a schedule.
+# macOS runners are capacity-starved: a queued leg in a shared matrix blocks the
+# whole pipeline for tens of minutes (and macos-14 was retired on 2026-11-02,
+# which is what cancelled the earlier legs). This workflow is therefore
+# separate and on demand.
+#
+# Current images: macos-26 (arm64, `macos-latest`) and macos-26-intel (x64).
+# The Intel leg is a real Intel runner, so no Rosetta is involved.
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 6 * * 1"      # Mondays, off-peak
+    - cron: "23 6 * * 1"      # Mondays, off-peak
   push:
     paths: ["src/**", "CMakeLists.txt", "vendor/**"]
 
@@ -21,20 +25,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: macos-arm64, os: macos-14, arch: arm64 }
-          # Intel slice, cross-built on the arm64 runner; runs under Rosetta 2.
-          - { name: macos-x86_64, os: macos-14, arch: x86_64 }
+          - { name: macos-arm64, os: macos-26, arch: arm64 }
+          - { name: macos-x86_64, os: macos-26-intel, arch: x86_64 }
     steps:
       - uses: actions/checkout@v7
       - name: Configure
         run: >-
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
           -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }}
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
       - name: Build
         run: cmake --build build --config Release -j2
       - name: CI gate
         run: scripts/ci-test.sh
-      - name: App bundle
+      - name: App bundle (ad-hoc signed, not notarised)
         run: bash scripts/build_mac.sh Release
       - uses: actions/upload-artifact@v7
         with:
