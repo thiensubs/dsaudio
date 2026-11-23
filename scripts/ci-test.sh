@@ -10,11 +10,18 @@ set -eu
 BUILD="${BUILD_DIR:-build}"
 GUI="${1:-}"
 
+# Resolve the binaries: MSVC puts them in build/Release and adds .exe.
+pick() { ls "$BUILD"/$1* 2>/dev/null | head -n 1; }
+MCP="$(pick dsaudio-mcp)"
+CLI="$(pick dsaudio-cli)"
+APP="$(pick dsaudio | rg -v 'mcp|cli' || true)"
+[ -n "$MCP" ] || { echo "dsaudio-mcp not built"; exit 1; }
+
 echo "== ctest =="
 ctest --test-dir "$BUILD" --output-on-failure -C Release
 
 echo "== mcp selftest =="
-"./$BUILD/dsaudio-mcp" --selftest | python3 -c \
+"$MCP" --selftest | python3 -c \
   "import json,sys; d=json.load(sys.stdin); assert len(d['tools'])==4, d; \
 print('tools:', ', '.join(t['name'] for t in d['tools']))"
 
@@ -23,7 +30,7 @@ printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"health","arguments":{}}}' \
   '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"nope","arguments":{}}}' \
-  | "./$BUILD/dsaudio-mcp" > /tmp/ds-mcp-out.txt
+  | "$MCP" > /tmp/ds-mcp-out.txt
 python3 - <<'PY'
 import json
 lines = [json.loads(l) for l in open('/tmp/ds-mcp-out.txt') if l.strip()]
@@ -37,7 +44,7 @@ echo "== cli reports a missing key cleanly =="
 set +e
 TMPHOME=$(mktemp -d)
 trap "rm -rf $TMPHOME" EXIT
-OUT=$(env -u DEEPSEEK_API_KEY HOME="$TMPHOME" "./$BUILD/dsaudio-cli" config 2>&1)
+OUT=$(env -u DEEPSEEK_API_KEY HOME="$TMPHOME" "$CLI" config 2>&1)
 RC=$?
 set -e
 echo "$OUT"
@@ -46,7 +53,7 @@ echo "$OUT" | grep -qi "no key" || { echo "expected a no-key message"; exit 1; }
 
 if [ "$GUI" = "--with-gui" ]; then
   echo "== app smoke test under Xvfb =="
-  xvfb-run -a env DSAUDIO_QUIT_AFTER=6 "./$BUILD/dsaudio"
+  xvfb-run -a env DSAUDIO_QUIT_AFTER=6 "$APP"
 fi
 
 echo "CI GATE PASSED"
