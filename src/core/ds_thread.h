@@ -14,7 +14,8 @@ extern "C" {
 #include <windows.h>
 typedef struct ds_mutex { CRITICAL_SECTION cs; } ds_mutex;
 #else
-typedef struct ds_mutex { struct pthread_mutex_t_ *m; } ds_mutex;
+#include <pthread.h>
+typedef struct ds_mutex { pthread_mutex_t m; } ds_mutex;
 #endif
 
 ds_mutex *ds_mutex_new(void);
@@ -22,13 +23,9 @@ void ds_mutex_free(ds_mutex *m);
 void ds_mutex_lock(ds_mutex *m);
 void ds_mutex_unlock(ds_mutex *m);
 
-#if defined(_WIN32)
+#ifdef _WIN32
 typedef struct ds_thread { void *h; unsigned long tid; } ds_thread;
-#elif defined(__APPLE__)
-#include <pthread.h>
-typedef struct ds_thread { pthread_t t; _Bool started; } ds_thread;
 #else
-#include <pthread.h>
 typedef struct ds_thread { pthread_t t; int started; } ds_thread;
 #endif
 

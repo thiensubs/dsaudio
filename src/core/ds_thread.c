@@ -15,7 +15,7 @@ ds_mutex *ds_mutex_new(void) {
 #if defined(_WIN32)
     InitializeCriticalSection(&m->cs);
 #else
-    pthread_mutex_init((pthread_mutex_t *)m->m, NULL);
+    pthread_mutex_init(&m->m, NULL);
 #endif
     return m;
 }
@@ -25,7 +25,7 @@ void ds_mutex_free(ds_mutex *m) {
 #if defined(_WIN32)
     DeleteCriticalSection(&m->cs);
 #else
-    pthread_mutex_destroy((pthread_mutex_t *)m->m);
+    pthread_mutex_destroy(&m->m);
 #endif
     free(m);
 }
@@ -35,7 +35,7 @@ void ds_mutex_lock(ds_mutex *m) {
 #if defined(_WIN32)
     EnterCriticalSection(&m->cs);
 #else
-    pthread_mutex_lock((pthread_mutex_t *)m->m);
+    pthread_mutex_lock(&m->m);
 #endif
 }
 
@@ -44,7 +44,7 @@ void ds_mutex_unlock(ds_mutex *m) {
 #if defined(_WIN32)
     LeaveCriticalSection(&m->cs);
 #else
-    pthread_mutex_unlock((pthread_mutex_t *)m->m);
+    pthread_mutex_unlock(&m->m);
 #endif
 }
 
