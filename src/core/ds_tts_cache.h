@@ -21,7 +21,7 @@ typedef struct ds_tts_chunk_result {
     int chunks;        /* how many chunks the text was split into */
     int cached;        /* how many came from the cache */
     int generated;     /* how many were synthesized */
-    char err[512];
+    ds_err err;
     bool ok;
 } ds_tts_chunk_result;
 

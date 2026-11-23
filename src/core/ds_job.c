@@ -33,7 +33,7 @@ static void *job_thread(void *user) {
         ds_tts_chunk_result cr;
         if (!ds_tts_synth_cached(&cfg, j->text, j->voice, j->format, j->filter_markdown,
                                  &cr, NULL, NULL)) {
-            ds_err_set(&j->tts.err, "%s", cr.err);
+            ds_err_set(&j->tts.err, "%s", cr.err.text);
             ds_log_add(DS_LOG_ERROR, "tts: %s", j->tts.err.text);
             ds_tts_chunk_result_free(&cr);
         } else {

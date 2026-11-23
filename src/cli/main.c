@@ -87,7 +87,7 @@ static int cmd_tts(int argc, char **argv) {
     if (chunks) {
         ds_tts_chunk_result r;
         if (!ds_tts_synth_cached(&cfg, text, voice, format, filter, &r, NULL, NULL)) {
-            fprintf(stderr, "tts: %s\n", r.err);
+            fprintf(stderr, "tts: %s\n", r.err.text);
             ds_tts_chunk_result_free(&r);
             return 1;
         }
