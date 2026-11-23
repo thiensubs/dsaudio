@@ -38,10 +38,10 @@ printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"health","arguments":{}}}' \
   '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"nope","arguments":{}}}' \
-  | "$MCP" > /tmp/ds-mcp-out.txt
+  | "$MCP" > mcp-out.txt
 python3 - <<'PY'
 import json
-lines = [json.loads(l) for l in open('/tmp/ds-mcp-out.txt') if l.strip()]
+lines = [json.loads(l) for l in open('mcp-out.txt') if l.strip()]
 assert lines[0]['id'] == 1 and 'protocolVersion' in lines[0]['result'], lines[0]
 assert lines[1]['id'] == 2 and lines[1]['result']['isError'] is False, lines[1]
 assert lines[2]['id'] == 3 and lines[2]['error']['code'] == -32602, lines[2]
@@ -64,4 +64,5 @@ if [ "$GUI" = "--with-gui" ]; then
   xvfb-run -a env DSAUDIO_QUIT_AFTER=6 "$APP"
 fi
 
+rm -f mcp-out.txt
 echo "CI GATE PASSED"

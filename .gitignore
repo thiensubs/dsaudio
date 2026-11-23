@@ -3,3 +3,4 @@ build/
 *.o
 *.d
 .ci-empty-home/
+mcp-out.txt
