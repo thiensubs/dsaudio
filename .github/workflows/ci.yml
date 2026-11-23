@@ -50,7 +50,7 @@ jobs:
 
       # The gate: pure logic, offline, every platform.
       - name: Core tests
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build --output-on-failure -C Release
 
       # The transport and protocol layers, offline.
       - name: MCP selftest

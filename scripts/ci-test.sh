@@ -11,7 +11,7 @@ BUILD="${BUILD_DIR:-build}"
 GUI="${1:-}"
 
 echo "== ctest =="
-ctest --test-dir "$BUILD" --output-on-failure
+ctest --test-dir "$BUILD" --output-on-failure -C Release
 
 echo "== mcp selftest =="
 "./$BUILD/dsaudio-mcp" --selftest | python3 -c \
