@@ -54,6 +54,17 @@ jobs:
       - name: CI gate
         shell: bash
         run: scripts/ci-test.sh
+      - name: Package the binaries
+        if: runner.os == 'Linux' && matrix.arch == 'x86_64'
+        run: |
+          mkdir -p dist
+          tar -czf dist/dsaudio-linux-x86_64.tar.gz -C build dsaudio dsaudio-cli dsaudio-mcp
+      - uses: actions/upload-artifact@v7
+        if: runner.os == 'Linux' && matrix.arch == 'x86_64'
+        with:
+          name: bin-linux-x86_64
+          path: dist/dsaudio-linux-x86_64.tar.gz
+
       - name: Upload test artifacts
         if: failure()
         uses: actions/upload-artifact@v7
@@ -63,3 +74,43 @@ jobs:
             build/**/CMakeCache.txt
             build/**/*.log
           if-no-files-found: ignore
+
+  # A different libc, not another glibc LTS: musl differs in pthread and in the
+  # libc extensions it omits, which is what containers actually ship.
+  test:linux:musl:
+    name: linux-musl
+    runs-on: ubuntu-24.04
+    container:
+      image: alpine:3.24
+    steps:
+      - uses: actions/checkout@v7
+      - name: Dependencies
+        run: apk add --no-cache build-base cmake samurai curl-dev alsa-lib-dev libx11-dev linux-headers
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -G Ninja
+      - name: Build
+        run: cmake --build build -j2
+      - name: CI gate
+        run: scripts/ci-test.sh
+
+  # The binary built on the oldest LTS must run on a newer one; that is the claim
+  # a user actually depends on, and it costs one runner instead of three builds.
+  run:linux:24.04:
+    name: run-on-24.04
+    runs-on: ubuntu-24.04
+    needs: test
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: bin-linux-x86_64
+          path: bin
+      - name: Runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libcurl4 libasound2t64 xvfb
+      - name: Run the 22.04-built binaries
+        run: |
+          tar -xzf bin/dsaudio-linux-x86_64.tar.gz -C bin
+          ./bin/dsaudio-mcp --selftest | head -c 120; echo
+          HOME="$PWD/.ci-home" ./bin/dsaudio-cli config | head -2
+          xvfb-run -a env DSAUDIO_QUIT_AFTER=6 ./bin/dsaudio
