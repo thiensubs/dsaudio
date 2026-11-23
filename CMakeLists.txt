@@ -58,6 +58,9 @@ if(APPLE)
         "-framework Security")
 elseif(WIN32)
     target_link_libraries(ds_core PUBLIC ws2_32 crypt32)
+elseif(UNIX)
+    # miniaudio's Linux backend is ALSA; it also needs dl and m.
+    target_link_libraries(ds_core PUBLIC asound ${CMAKE_DL_LIBS} m)
 endif()
 
 enable_language(C)
