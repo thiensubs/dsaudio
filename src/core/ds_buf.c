@@ -132,9 +132,17 @@ char *ds_self_path(void) {
 }
 
 double ds_now_sec(void) {
+#if defined(_WIN32)
+    /* MSVC has no clock_gettime and no CLOCK_MONOTONIC. */
+    LARGE_INTEGER freq, counter;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&counter);
+    return (double)counter.QuadPart / (double)freq.QuadPart;
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+#endif
 }
 
 /* --- UTF-8 --------------------------------------------------------------- */

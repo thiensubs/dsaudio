@@ -236,18 +236,18 @@ bool ds_keychain_get(const char *service, const char *account, char *out, size_t
     size_t raw_n = 0;
     unsigned char *raw = b64_decode(b64, &raw_n);
     if (!raw) return false;
-    DATA_BLOB in, out;
+    DATA_BLOB in, plain;          /* not "out": that is the char * parameter */
     in.pbData = raw;
     in.cbData = (DWORD)raw_n;
-    if (!CryptUnprotectData(&in, NULL, NULL, NULL, NULL, 0, &out)) {
+    if (!CryptUnprotectData(&in, NULL, NULL, NULL, NULL, 0, &plain)) {
         free(raw);
         if (err) snprintf(err, errcap, "DPAPI unprotect failed (err %lu)", GetLastError());
         return false;
     }
-    size_t copy = out.cbData < cap - 1 ? out.cbData : cap - 1;
-    memcpy(out, out.pbData, copy);
+    size_t copy = plain.cbData < cap - 1 ? plain.cbData : cap - 1;
+    memcpy(out, plain.pbData, copy);
     out[copy] = '\0';
-    LocalFree(out.pbData);
+    LocalFree(plain.pbData);
     free(raw);
     return true;
 }
