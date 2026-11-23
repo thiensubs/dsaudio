@@ -1,0 +1,78 @@
+#!/usr/bin/expect -f
+# Build and test dsaudio inside the local Alpine VM (vm/minlinux).
+#
+# The guest is booted headless with the source tree shared over virtfs, so no
+# sshd and no network are needed. Everything the CI Linux leg does is done here:
+# the core test suite, the CLI, the MCP request path, and the GUI under Xvfb.
+#
+# Usage: expect scripts/vm-linux.exp
+set BASE "/Users/thiensubs/Documents/KIMI_NIM/vm/minlinux"
+set LOG  "$BASE/logs/dsaudio-linux.log"
+set timeout 900
+log_file -noappend $LOG
+
+spawn $BASE/qemu/bin/qemu-system-x86_64 \
+    -accel hvf -cpu qemu64 -m 2048 -smp 2 -machine q35 \
+    -drive file=$BASE/disk.qcow2,if=virtio,format=qcow2 \
+    -nic user,model=virtio-net-pci \
+    -display none -monitor none -serial stdio
+
+proc sh {cmd} {
+    expect -re {minlinux:~#}
+    send "$cmd\r"
+}
+
+expect {
+    -re {login:} { send "root\r" }
+    timeout { puts "\nFAIL: no login prompt"; exit 1 }
+}
+expect {
+    -re {minlinux:~#} { }
+    timeout { puts "\nFAIL: no shell"; exit 1 }
+}
+
+sh "ip link set eth0 up; udhcpc -i eth0 -q -n; wget -q -O /tmp/src.tgz http://10.0.2.2:8099/dsaudio-src.tgz && mkdir -p /mnt/dsaudio && tar xzf /tmp/src.tgz -C /mnt/dsaudio && echo SRC_OK"
+expect {
+    -re {SRC_OK} { }
+    timeout { puts "\nFAIL: source did not download"; exit 1 }
+}
+expect -re {minlinux:~#}
+
+sh "apk add --no-cache build-base cmake samurai curl-dev alsa-lib-dev libx11-dev mesa-gl xvfb 2>&1 | tail -3; echo APK_DONE"
+expect -re {APK_DONE}
+expect -re {minlinux:~#}
+
+sh "cd /mnt/dsaudio && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release > /tmp/cmake.log 2>&1; echo CMAKE_RC=\$?"
+expect -re {CMAKE_RC=(\d+)}
+expect -re {minlinux:~#}
+if $expect_out(1,string) != "0" { puts "\nFAIL: cmake configure"; exit 1 }
+
+sh "cmake --build build --config Release -j2 > /tmp/build.log 2>&1; echo BUILD_RC=\$?"
+expect -re {BUILD_RC=(\d+)}
+expect -re {minlinux:~#}
+if $expect_out(1,string) != "0" {
+    sh "tail -25 /tmp/build.log; echo BUILD_TAIL_DONE"
+    expect -re {BUILD_TAIL_DONE}
+    expect -re {minlinux:~#}
+    puts "\nFAIL: build"; exit 1
+}
+
+sh "ctest --test-dir build --output-on-failure 2>&1 | tail -6; echo CTEST_DONE"
+expect -re {CTEST_DONE}
+expect -re {minlinux:~#}
+
+sh "./build/dsaudio-mcp --selftest | head -c 80; echo; echo SELFTEST_DONE"
+expect -re {SELFTEST_DONE}
+expect -re {minlinux:~#}
+
+sh "xvfb-run -a env DSAUDIO_QUIT_AFTER=6 ./build/dsaudio; echo APP_RC=\$?"
+expect -re {APP_RC=(\d+)}
+expect -re {minlinux:~#}
+
+sh "echo LINUX_TEST_DONE"
+expect -re {LINUX_TEST_DONE}
+expect -re {minlinux:~#}
+
+send "poweroff -f\r"
+expect eof
+puts "\nLINUX TEST DRIVER EXITED"
