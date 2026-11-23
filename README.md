@@ -41,6 +41,17 @@ The 4.49 s window is dominated by parsing the 1.4 MB of embedded fonts (Latin,
 Vietnamese and the CJK fallbacks). Lazy-loading the CJK subsets only when a CJK
 language is selected is the obvious next win.
 
+## Import and export formats
+
+| Direction | Formats |
+|---|---|
+| ASR import | WAV (16-bit PCM), Ogg Opus, and MP3 / FLAC (decoded locally to WAV first) |
+| TTS / export | WAV and raw PCM (24 kHz mono 16-bit) |
+
+There is deliberately **no MP3 encoder**: MP3 encoding means LAME (LGPL), and at these
+clip sizes the win is small. Ogg Opus would be the licence-clean, better-quality
+alternative and our own ASR re-ingests it, but it is not implemented yet.
+
 ## Chunked TTS: edit one sentence, pay for one sentence
 
 `docs/tts-chunks-cold.png` and `docs/tts-chunks-edited.png` show the same text
