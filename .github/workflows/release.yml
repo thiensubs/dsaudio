@@ -62,9 +62,9 @@ jobs:
         run: |
           mkdir -p dist
           if [[ "${{ matrix.os }}" == macos-* ]]; then
-            tar -czf dist/{{ matrix.asset }}.tar.gz -C build dsaudio.app
+            tar -czf dist/${{ matrix.asset }}.tar.gz -C build dsaudio.app
           else
-            tar -czf dist/{{ matrix.asset }}.tar.gz -C build dsaudio
+            tar -czf dist/${{ matrix.asset }}.tar.gz -C build dsaudio
           fi
           tar -czf dist/${{ matrix.mcp }}.tar.gz -C build dsaudio-mcp
           (cd dist && shasum -a 256 *.tar.gz > SHA256SUMS)
