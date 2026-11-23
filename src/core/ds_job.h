@@ -9,7 +9,7 @@
 #include "ds_core.h"
 #include "ds_tts.h"
 
-#include <pthread.h>
+#include "ds_thread.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -36,8 +36,8 @@ typedef struct ds_job {
     ds_asr_result asr;
     ds_balance balance;
 
-    pthread_t thread;
-    pthread_mutex_t mutex;
+    ds_thread thread;
+    ds_mutex *mutex;
 } ds_job;
 
 void ds_job_init(ds_job *j);

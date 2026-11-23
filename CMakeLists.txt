@@ -32,6 +32,7 @@ add_library(ds_core STATIC
     src/core/ds_config.c
     src/core/ds_keychain.c
     src/core/ds_tts.c
+    src/core/ds_thread.c
     src/core/ds_tts_cache.c
     src/core/ds_asr.c
     src/core/ds_audio.c

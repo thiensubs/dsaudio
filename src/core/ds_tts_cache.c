@@ -39,7 +39,8 @@ const char *ds_cache_dir(void) {
 static bool mkdir_p(const char *path) {
 #ifdef _WIN32
     return CreateDirectoryA(path, NULL) != 0 || GetLastError() == ERROR_ALREADY_EXISTS;
-#else
+#endif
+#if !defined(_WIN32)
     char tmp[900];
     snprintf(tmp, sizeof tmp, "%s", path);
     for (char *p = tmp + 1; *p; p++) {
@@ -59,6 +60,23 @@ bool ds_cache_clear(char *err, size_t cap) {
         snprintf(err, cap, "cannot create %s", dir);
         return false;
     }
+#ifdef _WIN32
+    char pattern[1000];
+    snprintf(pattern, sizeof pattern, "%s\\*", dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return true;   /* nothing cached */
+    int failed = 0;
+    do {
+        if (fd.cFileName[0] == '.') continue;
+        char path[1200];
+        snprintf(path, sizeof path, "%s\\%s", dir, fd.cFileName);
+        if (!DeleteFileA(path)) failed++;
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    if (failed) snprintf(err, cap, "%d cached file(s) could not be removed", failed);
+    return failed == 0;
+#else
     DIR *d = opendir(dir);
     if (!d) {
         snprintf(err, cap, "cannot open %s", dir);
@@ -75,6 +93,7 @@ bool ds_cache_clear(char *err, size_t cap) {
     closedir(d);
     if (failed) snprintf(err, cap, "%d cached file(s) could not be removed", failed);
     return failed == 0;
+#endif
 }
 
 /* --- chunking ---------------------------------------------------------------- */
