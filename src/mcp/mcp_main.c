@@ -22,9 +22,11 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
-#include <mach-o/dyld.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 #endif
 
 #define DS_MCP_VERSION "1.0.0"
