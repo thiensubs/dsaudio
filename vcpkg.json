@@ -1,0 +1,8 @@
+{
+  "name": "dsaudio",
+  "version": "0.1.0",
+  "description": "DeepSeek TTS and ASR in one C application",
+  "dependencies": [
+    { "name": "curl", "platform": "windows" }
+  ]
+}

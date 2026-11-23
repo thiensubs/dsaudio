@@ -34,12 +34,12 @@ jobs:
             libcurl4-openssl-dev libasound2-dev libx11-dev libgl1-mesa-dev \
             xvfb xauth
 
-      - name: Windows curl (vcpkg)
+      - name: Windows curl (vcpkg manifest mode)
         if: startsWith(matrix.os, 'windows')
         run: |
           git clone --depth 1 https://github.com/microsoft/vcpkg.git "$env:RUNNER_TEMP\vcpkg"
           & "$env:RUNNER_TEMP\vcpkg\bootstrap-vcpkg.bat" | Out-Null
-          & "$env:RUNNER_TEMP\vcpkg\vcpkg.exe" install curl:x64-windows-static
+          echo "VCPKG_ROOT=$env:RUNNER_TEMP\vcpkg" >> $env:GITHUB_ENV
           echo "CMAKE_TOOLCHAIN_FILE=$env:RUNNER_TEMP\vcpkg\scripts\buildsystems\vcpkg.cmake" >> $env:GITHUB_ENV
 
       - name: Configure
