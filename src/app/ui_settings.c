@@ -56,7 +56,7 @@ void ui_settings(cui_ctx *ui, app_state *a) {
                           .password = true,
                           .clearable = true,
                           .width = CUI_PX(420),
-                          .hint = "Stored in this app's config file. Never printed."))
+                          .hint = "Stored in the OS keychain when it is available. Never printed."))
                 a->set_dirty = true;
             if (cui_button(ui, ds_job_is_running(&a->job) ? "Checking..." : "Check key",
                            .icon = CUI_ICON_KEY_ROUND,
