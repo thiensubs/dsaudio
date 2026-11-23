@@ -66,7 +66,7 @@ static void *job_thread(void *user) {
             if (ds_config_ensure_output_dir(&cfg, err, sizeof err)) {
                 time_t now = time(NULL);
                 struct tm tm;
-                localtime_r(&now, &tm);
+                ds_localtime(now, &tm);
                 char stamp[32];
                 strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", &tm);
                 snprintf(art->path, sizeof art->path, "%s/tts-%s.%s", cfg.output_dir, stamp,

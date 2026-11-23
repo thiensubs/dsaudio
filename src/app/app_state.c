@@ -11,7 +11,7 @@
 static void stamp_now(char *out, size_t cap) {
     time_t t = time(NULL);
     struct tm tm;
-    localtime_r(&t, &tm);
+    ds_localtime(t, &tm);
     strftime(out, cap, "%H:%M:%S", &tm);
 }
 

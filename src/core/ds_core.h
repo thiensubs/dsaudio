@@ -40,6 +40,13 @@ size_t ds_utf8_billed_len(const char *s);
 /* Monotonic seconds. */
 double ds_now_sec(void);
 
+/* localtime_r / localtime_s / localtime, one call. */
+#include <time.h>
+void ds_localtime(time_t t, struct tm *out);
+
+/* fopen succeeds: no access()/unistd.h needed on Windows. */
+bool ds_file_readable(const char *path);
+
 /* The OS light/dark setting: true when dark. false when unknown. */
 bool ds_system_dark(void);
 

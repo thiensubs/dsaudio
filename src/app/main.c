@@ -10,8 +10,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <unistd.h>
-
 #include "fonts_cjk.h"
 
 static const char *kPages[] = {"Speech", "Transcribe", "MCP", "Settings"};

@@ -90,6 +90,21 @@ void ds_err_clear(ds_err *e) {
     e->text[0] = '\0';
 }
 
+void ds_localtime(time_t t, struct tm *out) {
+#if defined(_WIN32)
+    localtime_s(out, &t);
+#else
+    localtime_r(&t, out);
+#endif
+}
+
+bool ds_file_readable(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    fclose(f);
+    return true;
+}
+
 bool ds_system_dark(void) {
 #if defined(__APPLE__)
     CFStringRef v = (CFStringRef)CFPreferencesCopyValue(

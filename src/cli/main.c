@@ -20,7 +20,7 @@
 static void stamp(char *out, size_t cap) {
     time_t t = time(NULL);
     struct tm tm;
-    localtime_r(&t, &tm);
+    ds_localtime(t, &tm);
     strftime(out, cap, "%Y%m%d-%H%M%S", &tm);
 }
 
