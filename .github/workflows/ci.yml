@@ -1,0 +1,115 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64, os: ubuntu-22.04, arch: x86_64 }
+          - { name: linux-arm64, os: ubuntu-22.04-arm, arch: arm64 }
+          - { name: windows-x86_64, os: windows-2022, arch: x86_64 }
+          - { name: macos-x86_64, os: macos-13, arch: x86_64 }
+          - { name: macos-arm64, os: macos-14, arch: arm64 }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux dependencies
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libcurl4-openssl-dev libasound2-dev libx11-dev libgl1-mesa-dev \
+            xvfb xauth
+
+      - name: Windows curl (vcpkg)
+        if: startsWith(matrix.os, 'windows')
+        run: |
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git "$env:RUNNER_TEMP\vcpkg"
+          & "$env:RUNNER_TEMP\vcpkg\bootstrap-vcpkg.bat" | Out-Null
+          & "$env:RUNNER_TEMP\vcpkg\vcpkg.exe" install curl:x64-windows-static
+          echo "CMAKE_TOOLCHAIN_FILE=$env:RUNNER_TEMP\vcpkg\scripts\buildsystems\vcpkg.cmake" >> $env:GITHUB_ENV
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release -j2
+
+      # The gate: pure logic, offline, every platform.
+      - name: Core tests
+        run: ctest --test-dir build --output-on-failure
+
+      # The transport and protocol layers, offline.
+      - name: MCP selftest
+        shell: bash
+        run: |
+          ./build/dsaudio-mcp --selftest | python3 -c \
+            "import json,sys; d=json.load(sys.stdin); assert len(d['tools'])==4, d; print('tools:', ', '.join(t['name'] for t in d['tools']))"
+
+      - name: MCP request path
+        shell: bash
+        run: |
+          printf '%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"health","arguments":{}}}' \
+            '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"nope","arguments":{}}}' \
+            | ./build/dsaudio-mcp > out.txt
+          python3 - <<'PY'
+          import json
+          lines = [json.loads(l) for l in open('out.txt') if l.strip()]
+          assert lines[0]['id'] == 1 and 'protocolVersion' in lines[0]['result'], lines[0]
+          assert lines[1]['id'] == 2 and lines[1]['result']['isError'] is False, lines[1]
+          assert lines[2]['id'] == 3 and lines[2]['error']['code'] == -32602, lines[2]
+          print('json-rpc request path ok')
+          PY
+
+      - name: CLI reports a missing key cleanly
+        shell: bash
+        run: |
+          set +e
+          out=$(./build/dsaudio-cli config 2>&1)
+          rc=$?
+          echo "$out"
+          [ "$rc" = 2 ] || { echo "expected rc 2 (no key), got $rc"; exit 1; }
+          echo "$out" | grep -qi "no key" || { echo "expected a no-key message"; exit 1; }
+
+      # The real window, on a virtual display.
+      - name: App smoke test (Xvfb)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          xvfb-run -a env DSAUDIO_QUIT_AFTER=6 ./build/dsaudio
+          echo "app exited $?"
+
+      - name: App smoke test (headless quit)
+        if: matrix.os != 'ubuntu'
+        shell: bash
+        run: |
+          ./build/dsaudio > /dev/null 2>&1 &
+          pid=$!
+          sleep 1
+          kill $pid 2>/dev/null
+          wait $pid 2>/dev/null
+          echo "app launched and was stopped"
+
+      - name: Upload test artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fail-${{ matrix.name }}
+          path: |
+            build/**/CMakeCache.txt
+            build/**/*.log
+          if-no-files-found: ignore
