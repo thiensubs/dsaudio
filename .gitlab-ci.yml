@@ -1,0 +1,151 @@
+# GitLab pipeline: build + test on Linux (x86_64/arm64), Windows and macOS,
+# then package and publish a release with notes.
+#
+# Prerequisites:
+#   * the project must be a git repository pushed to GitLab
+#   * runners: a Linux Docker runner, a Windows shell runner (tags: windows),
+#     and a macOS runner (tags: saas-macos-14 or your own mac)
+#
+# The gate itself is scripts/ci-test.sh, the same one the GitHub pipeline runs.
+stages:
+  - test
+  - package
+  - release
+
+variables:
+  CMAKE_BUILD_TYPE: Release
+
+.default:
+  before_script:
+    - cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+    - cmake --build build --config Release -j2
+
+# --- Linux ------------------------------------------------------------------
+
+.test:linux:
+  extends: .default
+  image: ubuntu:22.04
+  before_script:
+    - apt-get update
+    - apt-get install -y --no-install-recommends
+        build-essential cmake libcurl4-openssl-dev libasound2-dev
+        libx11-dev libgl1-mesa-dev xvfb ca-certificates python3
+    - cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+    - cmake --build build --config Release -j2
+  script:
+    - scripts/ci-test.sh --with-gui
+  artifacts:
+    when: always
+    paths: [build/Testing]
+    reports:
+      junit: build/Testing/**/Test.xml
+
+test:linux:x86_64:
+  extends: .test:linux
+
+test:linux:arm64:
+  extends: .test:linux
+  image: arm64v8/ubuntu:22.04
+  tags: [arm64]
+
+# --- Windows ----------------------------------------------------------------
+# Needs a Windows shell runner. vcpkg supplies a static libcurl.
+
+test:windows:
+  extends: .default
+  tags: [windows, shell]
+  before_script:
+    - git clone --depth 1 https://github.com/microsoft/vcpkg.git $env:RUNNER_TEMP\vcpkg
+    - & $env:RUNNER_TEMP\vcpkg\bootstrap-vcpkg.bat
+    - & $env:RUNNER_TEMP\vcpkg\vcpkg.exe install curl:x64-windows-static
+    - echo "CMAKE_TOOLCHAIN_FILE=$env:RUNNER_TEMP\vcpkg\scripts\buildsystems\vcpkg.cmake" >> $env:GITHUB_ENV
+    - cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+    - cmake --build build --config Release -j2
+  script:
+    - scripts/ci-test.sh
+
+# --- macOS ------------------------------------------------------------------
+
+test:macos:
+  extends: .default
+  tags: [saas-macos-14]
+  script:
+    - scripts/ci-test.sh
+
+# --- Packaging --------------------------------------------------------------
+
+.package:
+  stage: package
+  needs: ["test:linux:x86_64", "test:linux:arm64", "test:windows", "test:macos"]
+  rules:
+    - if: $CI_COMMIT_TAG
+
+package:linux:
+  extends: .package
+  image: ubuntu:22.04
+  parallel:
+    matrix:
+      - ARCH: [x86_64, arm64]
+  script:
+    - apt-get update && apt-get install -y --no-install-recommends build-essential cmake libcurl4-openssl-dev libasound2-dev libx11-dev libgl1-mesa-dev
+    - cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+    - cmake --build build --config Release -j2
+    - tar -czf dsaudio-linux-$ARCH.tar.gz -C build dsaudio
+    - tar -czf dsaudio-mcp-linux-$ARCH.tar.gz -C build dsaudio-mcp
+    - sha256sum *.tar.gz > SHA256SUMS
+  artifacts:
+    paths: ["*.tar.gz", SHA256SUMS]
+
+package:windows:
+  extends: .package
+  tags: [windows, shell]
+  script:
+    - cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+    - cmake --build build --config Release -j2
+    - 7z a dsaudio-windows-x86_64.zip build/Release/dsaudio.exe
+    - 7z a dsaudio-mcp-windows-x86_64.zip build/Release/dsaudio-mcp.exe
+  artifacts:
+    paths: ["*.zip"]
+
+package:macos:
+  extends: .package
+  tags: [saas-macos-14]
+  script:
+    - bash scripts/build_mac.sh Release
+    - tar -czf dsaudio-macos-x86_64.tar.gz -C build dsaudio.app
+    - tar -czf dsaudio-mcp-darwin-x86_64.tar.gz -C build dsaudio-mcp
+    - sha256sum *.tar.gz > SHA256SUMS
+  artifacts:
+    paths: ["*.tar.gz", SHA256SUMS]
+
+# --- Release ----------------------------------------------------------------
+# GitLab renders this as the release page: description + asset links.
+
+release:
+  stage: release
+  needs: [package:linux, package:windows, package:macos]
+  rules:
+    - if: $CI_COMMIT_TAG
+  image: alpine:3.24
+  script:
+    - echo "publishing $CI_COMMIT_TAG"
+  release:
+    tag_name: $CI_COMMIT_TAG
+    description: |
+      ## dsaudio $CI_COMMIT_TAG
+
+      DeepSeek TTS and ASR in one C application: a native workbench, a CLI and
+      an MCP server sharing one core.
+
+      ### Install the MCP server
+
+      ```sh
+      curl -fsSL https://${CI_SERVER_HOST}/${CI_PROJECT_PATH}/-/releases/$CI_COMMIT_TAG/downloads/install.sh | sh
+      ```
+
+      ### Tested on
+
+      Linux x86_64 and arm64 (including a real window under Xvfb), Windows
+      x86_64, macOS x86_64 and arm64. Every leg runs the offline core tests,
+      the MCP JSON-RPC request path, the CLI key resolution, and the GUI smoke
+      test where a display is available.
