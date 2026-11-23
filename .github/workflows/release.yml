@@ -18,8 +18,6 @@ jobs:
         include:
           - { name: linux-x86_64, os: ubuntu-22.04, asset: dsaudio-linux-x86_64, mcp: dsaudio-mcp-linux-x86_64, ext: tar.gz }
           - { name: linux-arm64, os: ubuntu-22.04-arm, asset: dsaudio-linux-arm64, mcp: dsaudio-mcp-linux-arm64, ext: tar.gz }
-          - { name: macos-x86_64, os: macos-13, asset: dsaudio-macos-x86_64, mcp: dsaudio-mcp-darwin-x86_64, ext: tar.gz }
-          - { name: macos-arm64, os: macos-14, asset: dsaudio-macos-arm64, mcp: dsaudio-mcp-darwin-arm64, ext: tar.gz }
           - { name: windows-x86_64, os: windows-2022, asset: dsaudio-windows-x86_64, mcp: dsaudio-mcp-windows-x86_64, ext: zip }
 
     steps:
@@ -83,7 +81,6 @@ jobs:
 
   release:
     needs: build
-    if: always()   # macOS runners are capacity-starved; ship what landed
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8
