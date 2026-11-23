@@ -13,7 +13,7 @@ static void *job_thread(void *user) {
     ds_job *j = (ds_job *)user;
     double t0 = ds_now_sec();
 
-    ds_mutex_lock(&j->mutex);
+    ds_mutex_lock(j->mutex);
     ds_job_kind kind = j->kind;
     ds_config cfg = j->cfg;
     ds_tts_options opt;
@@ -25,7 +25,7 @@ static void *job_thread(void *user) {
     opt.timeout_s = j->timeout_s;
     char path[512];
     snprintf(path, sizeof path, "%s", j->path);
-    ds_mutex_unlock(&j->mutex);
+    ds_mutex_unlock(j->mutex);
 
     if (kind == DS_JOB_TTS) {
         /* Long text is synthesized in cached sentence chunks, so an edit only
@@ -101,10 +101,10 @@ static void *job_thread(void *user) {
                        j->balance.is_available ? "yes" : "no");
     }
 
-    ds_mutex_lock(&j->mutex);
+    ds_mutex_lock(j->mutex);
     j->elapsed = ds_now_sec() - t0;
     j->done = true;
-    ds_mutex_unlock(&j->mutex);
+    ds_mutex_unlock(j->mutex);
     return NULL;
 }
 
@@ -135,7 +135,7 @@ static bool start(ds_job *j) {
 
 bool ds_job_start_tts(ds_job *j, const ds_config *cfg, const char *text,
                       const char *voice, const char *format, bool filter_markdown) {
-    ds_mutex_lock(&j->mutex);
+    ds_mutex_lock(j->mutex);
     j->kind = DS_JOB_TTS;
     j->cfg = *cfg;
     snprintf(j->text, sizeof j->text, "%s", text ? text : "");
@@ -143,26 +143,26 @@ bool ds_job_start_tts(ds_job *j, const ds_config *cfg, const char *text,
     snprintf(j->format, sizeof j->format, "%s", format ? format : "wav");
     j->filter_markdown = filter_markdown;
     j->timeout_s = cfg->tts_timeout_s > 0 ? cfg->tts_timeout_s : 300;
-    ds_mutex_unlock(&j->mutex);
+    ds_mutex_unlock(j->mutex);
     return start(j);
 }
 
 bool ds_job_start_asr(ds_job *j, const ds_config *cfg, const char *path) {
-    ds_mutex_lock(&j->mutex);
+    ds_mutex_lock(j->mutex);
     j->kind = DS_JOB_ASR;
     j->cfg = *cfg;
     snprintf(j->path, sizeof j->path, "%s", path ? path : "");
     j->timeout_s = cfg->asr_timeout_s > 0 ? cfg->asr_timeout_s : 600;
-    ds_mutex_unlock(&j->mutex);
+    ds_mutex_unlock(j->mutex);
     return start(j);
 }
 
 bool ds_job_start_balance(ds_job *j, const ds_config *cfg) {
-    ds_mutex_lock(&j->mutex);
+    ds_mutex_lock(j->mutex);
     j->kind = DS_JOB_BALANCE;
     j->cfg = *cfg;
     j->timeout_s = 20;
-    ds_mutex_unlock(&j->mutex);
+    ds_mutex_unlock(j->mutex);
     return start(j);
 }
 
@@ -176,19 +176,19 @@ bool ds_job_is_running(const ds_job *j) {
 }
 
 bool ds_job_poll(ds_job *j) {
-    ds_mutex_lock(&j->mutex);
+    ds_mutex_lock(j->mutex);
     bool done = j->done;
-    ds_mutex_unlock(&j->mutex);
+    ds_mutex_unlock(j->mutex);
     return done;
 }
 
 void ds_job_harvest(ds_job *j) {
-    ds_mutex_lock(&j->mutex);
+    ds_mutex_lock(j->mutex);
     bool r = j->running;
-    ds_mutex_unlock(&j->mutex);
+    ds_mutex_unlock(j->mutex);
     if (r) ds_thread_join(&j->thread);
-    ds_mutex_lock(&j->mutex);
+    ds_mutex_lock(j->mutex);
     j->running = false;
     j->done = false;   /* cleared here, so poll cannot report the same job twice */
-    ds_mutex_unlock(&j->mutex);
+    ds_mutex_unlock(j->mutex);
 }
