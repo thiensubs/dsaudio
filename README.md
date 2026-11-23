@@ -12,6 +12,37 @@ dsaudio-mcp      the same core over the Model Context Protocol (stdio)
 Nothing here is Python or Node at runtime. C99, libcurl, simdjson and miniaudio,
 all vendored or system.
 
+## What it looks like
+
+The workbench has four views. Nothing on screen is hard-coded: every field is
+editable in the app and stored in its own config file, and the key goes to the
+OS keychain.
+
+![Speech view: long text is split into cached sentence chunks](docs/tts-chunks.png)
+
+Long text is cut into sentence chunks and each chunk is cached by content hash.
+Editing one sentence re-synthesizes only that chunk, so a mistake costs one
+request instead of a full regeneration. This shot reads
+`2 chunks - 0 from cache, 2 synthesized`; running the same text again is a cache
+hit and spends no tokens at all.
+
+![Transcribe view: drop audio, correct the transcript in place](docs/asr.png)
+
+MP3 and FLAC are decoded locally to WAV first, then uploaded. The transcript comes
+back editable, so a misheard word is one keystroke from fixed, and the correction
+can be diffed against the automatic text.
+
+![MCP view: the same core over stdio](docs/mcp.png)
+
+`dsaudio-mcp` exposes `tts_synthesize`, `asr_transcribe`, `config_get` and
+`health`. Installation is one command with a copy button for the shell snippet
+and one for the client config.
+
+![Settings view: key, endpoints, defaults and limits](docs/settings.png)
+
+Key and its store, base URL, output folder, default voice and format, timeouts,
+history size, waveform resolution and theme.
+
 ## Build
 
 ```sh
