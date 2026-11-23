@@ -91,6 +91,12 @@ if(WIN32)
 endif()
 
 # --- offline tests: pure logic, no network, no key ---------------------------
+# MSVC reads sources as the local codepage unless told otherwise; the CJK
+# billing test depends on UTF-8 bytes.
+if(MSVC)
+    add_compile_options(/utf-8)
+endif()
+
 enable_testing()
 add_executable(dsaudio-test tests/test_core.c)
 target_link_libraries(dsaudio-test PRIVATE ds_core)
