@@ -5,7 +5,9 @@ name: macos
 # which is what cancelled the earlier legs). This workflow is therefore
 # separate and on demand.
 #
-# Current images: macos-26 (arm64, `macos-latest`) and macos-26-intel (x64).
+# Current images: macos-15 (arm64) and macos-15-intel (x64). The macOS 26 SDK
+# floors the deployment target at 15.0, so older machines refuse to launch
+# the result; the 15 SDK still targets 11.0.
 # The Intel leg is a real Intel runner, so no Rosetta is involved.
 on:
   workflow_dispatch:
