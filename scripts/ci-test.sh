@@ -59,6 +59,32 @@ echo "$OUT"
 [ "$RC" = 2 ] || { echo "expected rc 2 (no key), got $RC"; exit 1; }
 echo "$OUT" | grep -qi "no key" || { echo "expected a no-key message"; exit 1; }
 
+# A config file must be able to replace the built-in base_url and output_dir,
+# and $DEEPSEEK_BASE_URL must still outrank it. macOS and Linux both resolve
+# those paths from $HOME; Windows uses its own folders, so it is skipped.
+case "$(uname -s)" in
+  Darwin|Linux)
+    CFG="$TMPHOME/.config/dsaudio"
+    mkdir -p "$CFG"
+    printf '%s' '{"base_url":"http://127.0.0.1:9/v1","output_dir":"/tmp/dsaudio-ci-out"}' \
+      > "$CFG/config.json"
+    set +e
+    OUT=$(env -u DEEPSEEK_API_KEY -u DEEPSEEK_BASE_URL HOME="$TMPHOME" "$CLI" config 2>&1)
+    set -e
+    echo "$OUT" | grep -q "http://127.0.0.1:9/v1" \
+      || { echo "config file base_url was ignored"; echo "$OUT"; exit 1; }
+    echo "$OUT" | grep -q "/tmp/dsaudio-ci-out" \
+      || { echo "config file output_dir was ignored"; echo "$OUT"; exit 1; }
+    set +e
+    OUT=$(env -u DEEPSEEK_API_KEY HOME="$TMPHOME" \
+          DEEPSEEK_BASE_URL="https://env.example/v1" "$CLI" config 2>&1)
+    set -e
+    echo "$OUT" | grep -q "https://env.example/v1" \
+      || { echo "\$DEEPSEEK_BASE_URL did not outrank the config file"; echo "$OUT"; exit 1; }
+    rm -rf /tmp/dsaudio-ci-out
+    ;;
+esac
+
 if [ "$GUI" = "--with-gui" ]; then
   echo "== app smoke test under Xvfb =="
   xvfb-run -a env DSAUDIO_QUIT_AFTER=6 "$APP"

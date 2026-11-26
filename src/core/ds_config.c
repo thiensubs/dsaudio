@@ -121,11 +121,14 @@ static void parse_json_config(const char *path, ds_config *c, char *note, size_t
         snprintf(note, note_cap, "key from %s (plain text - move it to the keychain)", path);
         snprintf(c->key_store, sizeof c->key_store, "config file");
     }
-    if (!c->base_url[0] && ds_json_str(j, "base_url", val, sizeof val) && val[0]) {
+    if (!c->base_from_env && !c->base_from_file &&
+        ds_json_str(j, "base_url", val, sizeof val) && val[0]) {
         snprintf(c->base_url, sizeof c->base_url, "%s", val);
+        c->base_from_file = true;
     }
-    if (!c->output_dir[0] && ds_json_str(j, "output_dir", val, sizeof val) && val[0]) {
+    if (!c->out_from_file && ds_json_str(j, "output_dir", val, sizeof val) && val[0]) {
         snprintf(c->output_dir, sizeof c->output_dir, "%s", val);
+        c->out_from_file = true;
     }
     c->tts_timeout_s = json_int(j, "tts_timeout_s", 30, 900, c->tts_timeout_s);
     c->asr_timeout_s = json_int(j, "asr_timeout_s", 60, 1800, c->asr_timeout_s);
@@ -193,8 +196,10 @@ static void parse_toml_config(const char *path, ds_config *c, char *note, size_t
                     snprintf(c->key_store, sizeof c->key_store, "kimi-code config");
                 } else if (strcmp(key, "api_key_env") == 0 && !api_key_env[0]) {
                     snprintf(api_key_env, sizeof api_key_env, "%s", value);
-                } else if (strcmp(key, "base_url") == 0 && !c->base_url[0]) {
+                } else if (strcmp(key, "base_url") == 0 && !c->base_from_env &&
+                           !c->base_from_file && value[0]) {
                     snprintf(c->base_url, sizeof c->base_url, "%s", value);
+                    c->base_from_file = true;
                 }
             }
         }
@@ -246,8 +251,10 @@ bool ds_config_load(ds_config *c) {
         snprintf(note, sizeof note, "key from $DEEPSEEK_API_KEY");
         snprintf(c->key_store, sizeof c->key_store, "environment");
     }
-    if (env_base && env_base[0])
+    if (env_base && env_base[0]) {
         snprintf(c->base_url, sizeof c->base_url, "%s", env_base);
+        c->base_from_env = true;
+    }
 
     char home[400];
     home_dir(home, sizeof home);

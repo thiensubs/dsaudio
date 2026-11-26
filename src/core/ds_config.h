@@ -22,6 +22,11 @@ typedef struct ds_config {
     char source[160];        /* human-readable note for the UI */
     char key_store[64];      /* "keychain", "protected file", "config file", ... */
     bool have_key;
+    /* Provenance of base_url/output_dir: a config file may replace the built-in
+     * default, but $DEEPSEEK_BASE_URL outranks every file. */
+    bool base_from_env;
+    bool base_from_file;
+    bool out_from_file;
 
     /* Every tunable the app uses, editable in Settings and persisted here. */
     int tts_timeout_s;       /* 30..900 */
