@@ -56,20 +56,23 @@ Xcode command line tools. Outputs `build/dsaudio`, `build/dsaudio-cli`,
 
 ## Binaries and timings
 
-Measured on the 2026-11-23 build (macOS x86_64, Release, embedded fonts loaded).
+Measured on the 2026-11-26 build (macOS x86_64, Release, CUI 1.5.0, embedded fonts
+loaded). The window figure is the median of three launches, from `exec` to the
+first frame macOS lists; the rest are wall-clock.
 
 | Application | Binary | Size | Time |
 |---|---|---|---|
-| `dsaudio` (workbench) | `build/dsaudio` | 2,508,584 B (2.4 MiB) | 4.49 s to a visible window, cold |
-| `dsaudio-cli` | `build/dsaudio-cli` | 1,274,200 B (1.2 MiB) | 0.64 s for `config` |
-| `dsaudio-mcp` | `build/dsaudio-mcp` | 1,273,776 B (1.2 MiB) | 0.60 s for `--selftest` |
-| TTS, 2 chunks, cold cache | – | 3.49 s | 2 requests, 0 from cache |
-| TTS, same text, warm cache | – | **0.54 s** | 0 requests, no token cost |
-| TTS, one sentence edited | – | 3.49 s | 1 request, 1 chunk reused |
-| ASR, 3 s clip | – | 1.2 s | 1 request |
+| `dsaudio` (workbench) | `build/dsaudio` | 2,326,880 B (2.2 MiB) | 4.95 s to a visible window |
+| `dsaudio-cli` | `build/dsaudio-cli` | 1,274,304 B (1.2 MiB) | 0.55 s for `config` |
+| `dsaudio-mcp` | `build/dsaudio-mcp` | 1,273,936 B (1.2 MiB) | 0.51 s for `--selftest` |
+| TTS, 2 chunks, cold cache | – | 5.09 s | 2 requests, 0 from cache |
+| TTS, same text, warm cache | – | **0.60 s** | 0 requests, no token cost |
+| TTS, one sentence edited | – | 1.75 s | 1 request, 1 chunk reused |
+| ASR, 3 s clip | – | 1.94 s | 1 request |
 
-The 4.49 s window is dominated by parsing the 1.4 MB of embedded fonts (Latin,
-Vietnamese and the CJK fallbacks). Lazy-loading the CJK subsets only when a CJK
+The 4.95 s window is dominated by parsing the embedded fonts: our four fallback
+subsets (Vietnamese 161 KB, Chinese 164 KB, Japanese 224 KB, Korean 174 KB) plus
+the faces CUI ships. Lazy-loading the CJK subsets only when a CJK
 language is selected is the obvious next win.
 
 ## Import and export formats
