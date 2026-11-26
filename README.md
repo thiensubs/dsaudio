@@ -15,8 +15,8 @@ all vendored or system.
 ## What it looks like
 
 The workbench has four views. Nothing on screen is hard-coded: every field is
-editable in the app and stored in its own config file, and the key goes to the
-OS keychain.
+editable in the app and persisted, and the key goes to the platform credential
+store — a mode-`0600` file where the platform has none.
 
 ![Speech view: long text is split into cached sentence chunks](docs/tts-chunks.png)
 
@@ -51,8 +51,8 @@ cmake --build build -j
 ```
 
 Needs a C99 compiler, CMake 3.14+, libcurl development headers, and on macOS
-Xcode command line tools. Outputs `build/dsaudio`, `build/dsaudio-cli`,
-`build/dsaudio-mcp`.
+Xcode command line tools (the release build targets macOS 11.0). Outputs
+`build/dsaudio`, `build/dsaudio-cli`, `build/dsaudio-mcp`.
 
 ## Binaries and timings
 
