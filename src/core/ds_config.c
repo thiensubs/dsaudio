@@ -3,6 +3,7 @@
 #include "ds_json.h"
 #include "ds_tts.h"
 #include "ds_keychain.h"
+#include "ds_i18n.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -231,7 +232,11 @@ void ds_config_init(ds_config *c) {
     snprintf(c->default_format, sizeof c->default_format, "wav");
     c->filter_markdown = true;
     c->theme = 2;
-    snprintf(c->language, sizeof c->language, "en");
+    /* The interface follows the machine unless the locale is one we do not
+     * ship, in which case English. A config file or Settings overrides this. */
+    int machine = ds_language_detect();
+    snprintf(c->language, sizeof c->language, "%s",
+             machine >= 0 ? ds_language_code(machine) : "en");
 }
 
 

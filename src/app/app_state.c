@@ -85,6 +85,7 @@ void app_state_init(app_state *a) {
     a->set_history_limit = a->cfg.history_limit;
     a->set_peaks = a->cfg.peaks;
     a->set_language = ds_language_index(a->cfg.language);
+    ds_i18n_set(a->set_language >= 0 ? a->set_language : DS_LANG_EN);
 
     char masked[128];
     ds_config_mask_key(&a->cfg, masked, sizeof masked);

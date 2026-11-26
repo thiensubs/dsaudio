@@ -1,6 +1,8 @@
 // ui_asr.c - the speech to text workbench.
 #include "app_state.h"
 
+#include "../core/ds_i18n.h"
+
 #include <cui/cui.h>
 #include <cui/cui_app.h>
 
@@ -12,8 +14,8 @@ static void pick_file(cui_ctx *ui, app_state *a) {
     cui_file_dialog_opts opts;
     memset(&opts, 0, sizeof opts);
     opts.kind = CUI_FILE_OPEN;
-    opts.title = "Choose audio to transcribe";
-    opts.filter_name = "Audio";
+    opts.title = ds_i18n("asr.choose");
+    opts.filter_name = ds_i18n("asr.audio");
     opts.filter = "wav;ogg;opus";
     if (cui_app_file_dialog(NULL, &opts, path, sizeof path)) {
         snprintf(a->asr_path, sizeof a->asr_path, "%s", path);
@@ -30,15 +32,15 @@ static void pick_file(cui_ctx *ui, app_state *a) {
 static void file_card(cui_ctx *ui, app_state *a) {
     cui_card(ui, .width = CUI_FILL, .gap = 12) {
         cui_row(ui, .gap = 8) {
-            cui_heading(ui, "Audio", 4);
+            cui_heading(ui, ds_i18n("asr.audio"), 4);
             cui_spacer(ui);
             if (a->asr_path[0])
-                cui_badge(ui, "loaded", .tone = CUI_TONE_INFO, .dot = true);
+                cui_badge(ui, ds_i18n("asr.loaded"), .tone = CUI_TONE_INFO, .dot = true);
         }
 
         int drop = cui_dropzone(ui, "asr-drop",
-                                .title = "Drop a WAV or Ogg Opus file here",
-                                .description = "WAV, Ogg Opus, MP3 or FLAC, mono or stereo, up to 8 MiB and 120 s",
+                                .title = ds_i18n("asr.drop_title"),
+                                .description = ds_i18n("asr.drop_desc"),
                                 .accept = "wav;ogg;opus;mp3;flac",
                                 .height = 140,
                                 .width = CUI_FILL);
@@ -68,24 +70,22 @@ static void file_card(cui_ctx *ui, app_state *a) {
         }
 
         if (a->job.asr.err.text[0] && !a->job.asr.ok) {
-            cui_alert(ui, "Transcription failed", .description = a->job.asr.err.text,
+            cui_alert(ui, ds_i18n("asr.fail_title"), .description = a->job.asr.err.text,
                       .tone = CUI_TONE_DANGER, .dismissible = true);
             cui_copy_button(ui, "copy-asr-err", a->job.asr.err.text);
         }
 
-        cui_alert(ui, "MP3 and FLAC are converted to WAV first",
-                  .description = "ASR takes WAV or Ogg Opus. Anything else is decoded locally, "
-                                 "then uploaded as WAV.",
+        cui_alert(ui, ds_i18n("asr.convert"),
+                  .description = ds_i18n("asr.convert_desc"),
                   .tone = CUI_TONE_NEUTRAL);
 
-        cui_alert(ui, "Language is detected automatically",
-                  .description = "On a very short clip the detector can pick the wrong language. "
-                                 "A longer utterance is far more reliable.",
+        cui_alert(ui, ds_i18n("asr.lang_note"),
+                  .description = ds_i18n("asr.lang_desc"),
                   .tone = CUI_TONE_NEUTRAL);
 
         cui_row(ui, .gap = 8) {
-            if (cui_button(ui, "Browse...", .icon = CUI_ICON_FOLDER_OPEN)) pick_file(ui, a);
-            if (cui_button(ui, ds_job_is_running(&a->job) ? "Transcribing..." : "Transcribe",
+            if (cui_button(ui, ds_i18n("common.browse"), .icon = CUI_ICON_FOLDER_OPEN)) pick_file(ui, a);
+            if (cui_button(ui, ds_job_is_running(&a->job) ? ds_i18n("asr.transcribing") : ds_i18n("asr.transcribe"),
                            .variant = CUI_BUTTON_PRIMARY,
                            .icon = CUI_ICON_MIC,
                            .loading = ds_job_is_running(&a->job),
@@ -99,18 +99,18 @@ static void file_card(cui_ctx *ui, app_state *a) {
 static void transcript_card(cui_ctx *ui, app_state *a) {
     cui_card(ui, .width = CUI_FILL, .gap = 12) {
         cui_row(ui, .gap = 8) {
-            cui_heading(ui, "Transcript", 4);
+            cui_heading(ui, ds_i18n("asr.transcript"), 4);
             cui_spacer(ui);
             if (a->asr_dirty)
-                cui_badge(ui, "edited", .tone = CUI_TONE_WARNING, .dot = true);
+                cui_badge(ui, ds_i18n("common.edited"), .tone = CUI_TONE_WARNING, .dot = true);
             else if (a->asr_transcript[0])
-                cui_badge(ui, "automatic", .tone = CUI_TONE_SUCCESS, .dot = true);
+                cui_badge(ui, ds_i18n("asr.automatic"), .tone = CUI_TONE_SUCCESS, .dot = true);
         }
 
         if (!a->asr_transcript[0]) {
-            cui_empty_state(ui, "No transcript yet",
+            cui_empty_state(ui, ds_i18n("asr.no_transcript"),
                             .icon = CUI_ICON_FILE_TEXT,
-                            .description = "Transcribe a file, then correct the text right here.",
+                            .description = ds_i18n("asr.no_transcript_desc"),
                             .action = NULL);
             return;
         }
@@ -126,17 +126,17 @@ static void transcript_card(cui_ctx *ui, app_state *a) {
         cui_code_editor_result r = cui_code_editor(ui, "asr-text", a->asr_transcript,
                                                    sizeof a->asr_transcript, .lang = "text",
                                                    .height = 200,
-                                                   .placeholder = "The transcript appears here...");
+                                                   .placeholder = ds_i18n("asr.placeholder"));
         if (r.changed) a->asr_dirty = true;
         if (r.refused)
-            cui_toast(ui, "That edit did not fit the buffer", .tone = CUI_TONE_WARNING);
+            cui_toast(ui, ds_i18n("common.edit_too_long"), .tone = CUI_TONE_WARNING);
 
         if (a->asr_dirty && strcmp(a->asr_original, a->asr_transcript) != 0) {
             cui_separator(ui);
             cui_row(ui, .gap = 8) {
-                cui_text(ui, "Correction", .font = CUI_FONT_MEDIUM);
+                cui_text(ui, ds_i18n("asr.correction"), .font = CUI_FONT_MEDIUM);
                 cui_spacer(ui);
-                if (cui_button(ui, "Revert to automatic", .icon = CUI_ICON_REFRESH_CW)) {
+                if (cui_button(ui, ds_i18n("asr.revert"), .icon = CUI_ICON_REFRESH_CW)) {
                     snprintf(a->asr_transcript, sizeof a->asr_transcript, "%s", a->asr_original);
                     a->asr_dirty = false;
                 }
@@ -144,19 +144,19 @@ static void transcript_card(cui_ctx *ui, app_state *a) {
             int change = 0;
             cui_diff_result d = cui_diff_view(ui, "asr-diff", a->asr_original, a->asr_transcript,
                                               .mode = CUI_DIFF_SPLIT, .current = &change,
-                                              .language = "text", .old_title = "automatic",
-                                              .new_title = "corrected", .height = 220);
+                                              .language = "text", .old_title = ds_i18n("asr.automatic"),
+                                              .new_title = ds_i18n("asr.corrected"), .height = 220);
             cui_textf(ui, "+%d -%d lines", d.added, d.removed);
         }
 
         cui_row(ui, .gap = 8) {
             cui_copy_button(ui, "copy-transcript", a->asr_transcript);
-            if (cui_button(ui, "Save transcript...", .icon = CUI_ICON_DOWNLOAD)) {
+            if (cui_button(ui, ds_i18n("asr.save"), .icon = CUI_ICON_DOWNLOAD)) {
                 char path[600];
                 cui_file_dialog_opts opts;
                 memset(&opts, 0, sizeof opts);
                 opts.kind = CUI_FILE_SAVE;
-                opts.title = "Save transcript";
+                opts.title = ds_i18n("asr.save_title");
                 opts.default_name = "transcript.txt";
                 if (cui_app_file_dialog(NULL, &opts, path, sizeof path)) {
                     FILE *f = fopen(path, "wb");
@@ -164,9 +164,9 @@ static void transcript_card(cui_ctx *ui, app_state *a) {
                         fwrite(a->asr_transcript, 1, strlen(a->asr_transcript), f);
                         fclose(f);
                         ds_log_add(DS_LOG_OK, "wrote %s", path);
-                        app_state_set_status(a, "saved %s", path);
+                        app_state_set_status(a, ds_i18n("asr.saved"), path);
                     } else {
-                        app_state_set_status(a, "cannot write %s", path);
+                        app_state_set_status(a, ds_i18n("asr.save_failed"), path);
                     }
                 }
             }
@@ -180,7 +180,7 @@ static void transcript_card(cui_ctx *ui, app_state *a) {
 
 void ui_asr(cui_ctx *ui, app_state *a) {
     cui_row(ui, .gap = 8) {
-        cui_heading(ui, "Speech to text", 2);
+        cui_heading(ui, ds_i18n("asr.title"), 2);
         cui_spacer(ui);
         cui_badge(ui, a->status, .tone = CUI_TONE_NEUTRAL);
     }
@@ -190,8 +190,7 @@ void ui_asr(cui_ctx *ui, app_state *a) {
         cui_text(ui, "POST", .font = CUI_FONT_MONO, .size = 11,
                  .color = CUI_COLOR_TEXT_SECONDARY);
     }
-    cui_secondary(ui, "WAV or Ogg Opus in, the transcript out. Edit it in place and diff the "
-                      "correction against the automatic text.");
+    cui_secondary(ui, ds_i18n("asr.subtitle"));
 
     file_card(ui, a);
     transcript_card(ui, a);

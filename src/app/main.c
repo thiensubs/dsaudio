@@ -1,6 +1,8 @@
 // main.c - the dsaudio workbench shell.
 #include "app_state.h"
 
+#include "../core/ds_i18n.h"
+
 #include "../core/ds_http.h"
 
 #include <cui/cui.h>
@@ -12,9 +14,16 @@
 
 #include "fonts_fallback.h"
 
-static const char *kPages[] = {"Speech", "Transcribe", "MCP", "Settings"};
+static void page_names(const char **out) {
+    out[0] = ds_i18n("nav.speech");
+    out[1] = ds_i18n("nav.transcribe");
+    out[2] = ds_i18n("nav.mcp");
+    out[3] = ds_i18n("nav.settings");
+}
 
 static void nav(cui_ctx *ui, app_state *a) {
+    const char *kPages[4];
+    page_names(kPages);
     cui_column(ui, .width = CUI_PX(200), .height = CUI_FILL, .pad = 14, .gap = 4,
                .bg = CUI_COLOR_SURFACE) {
         cui_row(ui, .gap = 8) {
@@ -35,7 +44,7 @@ static void nav(cui_ctx *ui, app_state *a) {
         cui_spacer(ui);
         cui_separator(ui);
         cui_gap(ui, 8);
-        if (cui_button(ui, "Session", .icon = CUI_ICON_LIST, .full_width = true))
+        if (cui_button(ui, ds_i18n("nav.session"), .icon = CUI_ICON_LIST, .full_width = true))
             a->context_open = !a->context_open;
         cui_gap(ui, 6);
         cui_theme_switcher(ui, &a->theme_mode, true);
@@ -48,9 +57,9 @@ static void nav(cui_ctx *ui, app_state *a) {
 
 static void session_card(cui_ctx *ui, app_state *a) {
     cui_card(ui, .width = CUI_FILL, .gap = 10) {
-        cui_heading(ui, "Last job", 4);
+        cui_heading(ui, ds_i18n("session.last_job"), 4);
         if (a->history_count == 0) {
-            cui_secondary(ui, "No job yet. The last TTS or ASR result is summarised here.");
+            cui_secondary(ui, ds_i18n("session.none"));
             return;
         }
         int sel = a->history_sel;
@@ -66,7 +75,7 @@ static void session_card(cui_ctx *ui, app_state *a) {
         char meta[128];
         snprintf(meta, sizeof meta, "%zu bytes - %s", h->bytes, h->note);
         cui_text(ui, meta, .color = CUI_COLOR_TEXT_SECONDARY);
-        if (cui_button(ui, "Clear history", .icon = CUI_ICON_TRASH_2)) {
+        if (cui_button(ui, ds_i18n("session.clear"), .icon = CUI_ICON_TRASH_2)) {
             a->history_count = 0;
             a->history_sel = -1;
         }
@@ -76,10 +85,10 @@ static void session_card(cui_ctx *ui, app_state *a) {
 static void activity_card(cui_ctx *ui, app_state *a) {
     (void)a;
     cui_card(ui, .width = CUI_FILL, .gap = 8) {
-        cui_heading(ui, "Activity", 4);
+        cui_heading(ui, ds_i18n("session.activity"), 4);
         int n = ds_log_count();
         if (n == 0) {
-            cui_secondary(ui, "Nothing logged yet.");
+            cui_secondary(ui, ds_i18n("session.activity_none"));
             return;
         }
         int start = n > 12 ? n - 12 : 0;
@@ -99,8 +108,7 @@ static void right_panel(cui_ctx *ui, app_state *a) {
                .bg = CUI_COLOR_SURFACE, .scroll_y = true) {
         session_card(ui, a);
         activity_card(ui, a);
-        cui_secondary(ui, "This window renders continuously so the waveform and progress stay "
-                          "live, which uses CPU while idle.");
+        cui_secondary(ui, ds_i18n("session.continuous_note"));
     }
 }
 
@@ -185,13 +193,12 @@ int main(void) {
             }
         }
 
-        cui_sheet(ui, "Session", &a.context_open, .side = CUI_SIDE_RIGHT, .size = 340) {
+        cui_sheet(ui, ds_i18n("nav.session"), &a.context_open, .side = CUI_SIDE_RIGHT, .size = 340) {
             cui_column(ui, .width = CUI_FILL, .height = CUI_FILL, .pad = 18, .gap = 14,
                        .scroll_y = true) {
                 session_card(ui, &a);
                 activity_card(ui, &a);
-                cui_secondary(ui, "This window renders continuously so the waveform and progress "
-                                  "stay live, which uses CPU while idle.");
+                cui_secondary(ui, ds_i18n("session.continuous_note"));
             }
         }
 

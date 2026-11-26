@@ -1,6 +1,8 @@
 // ui_mcp.c - the MCP server: what it exposes, how to install it, and a live
 // self test that runs the real binary.
 #include "app_state.h"
+
+#include "../core/ds_i18n.h"
 #include "../core/ds_mcp.h"
 
 #include <cui/cui.h>
@@ -43,21 +45,20 @@ static void run_selftest(cui_ctx *ui, app_state *a) {
 void ui_mcp(cui_ctx *ui, app_state *a) {
     find_mcp();
     cui_row(ui, .gap = 8) {
-        cui_heading(ui, "MCP server", 2);
+        cui_heading(ui, ds_i18n("mcp.title"), 2);
         cui_spacer(ui);
-        cui_badge(ui, selftest_ok ? "selftest run" : "not run yet", .tone = CUI_TONE_NEUTRAL);
+        cui_badge(ui, selftest_ok ? ds_i18n("mcp.selftest_run") : ds_i18n("mcp.not_run"), .tone = CUI_TONE_NEUTRAL);
     }
-    cui_secondary(ui, "The same core, exposed over the Model Context Protocol on stdio. "
-                      "An agent calls tts_synthesize or asr_transcribe and gets the result back.");
+    cui_secondary(ui, ds_i18n("mcp.subtitle"));
 
     cui_card(ui, .width = CUI_FILL, .gap = 12) {
-        cui_heading(ui, "Tools", 4);
+        cui_heading(ui, ds_i18n("mcp.tools"), 4);
         static const char *names[] = {"tts_synthesize", "asr_transcribe", "config_get", "health"};
-        static const char *descs[] = {
-            "Text to audio. Writes the file, returns the audio and its metadata.",
-            "Audio to text. WAV or Ogg Opus, language detected.",
-            "Base URL, whether a key is set, output folder.",
-            "Liveness and version.",
+        const char *descs[] = {
+            ds_i18n("mcp.tool_tts"),
+            ds_i18n("mcp.tool_asr"),
+            ds_i18n("mcp.tool_config"),
+            ds_i18n("mcp.tool_health"),
         };
         for (int i = 0; i < 4; i++) {
             cui_row(ui, .gap = 8) {
@@ -66,40 +67,39 @@ void ui_mcp(cui_ctx *ui, app_state *a) {
             }
         }
         cui_separator(ui);
-        cui_secondary(ui, "stdio transport, JSON-RPC 2.0. One request per line, one response per line.");
+        cui_secondary(ui, ds_i18n("mcp.transport"));
     }
 
     cui_card(ui, .width = CUI_FILL, .gap = 12) {
-        cui_heading(ui, "Install on this machine", 4);
+        cui_heading(ui, ds_i18n("mcp.install"), 4);
         char snippet[1200];
         snprintf(snippet, sizeof snippet,
-                 "# copy the server next to this app into ~/.local/bin\n"
+                 "%s\n"
                  "\"%s\" --install\n\n"
                  "# or, once a release is published:\n"
                  "curl -fsSL https://github.com/thiensubs/dsaudio/releases/latest/download/install.sh | sh",
-                 mcp_path);
-        cui_code_block(ui, "mcp-install", snippet, .lang = "shell", .title = "install");
-        cui_secondary(ui, "The binary is self-contained: C, simdjson and libcurl only. "
-                          "No Python, no Node, no runtime to install.");
+                 ds_i18n("mcp.install_comment"), mcp_path);
+        cui_code_block(ui, "mcp-install", snippet, .lang = "shell", .title = ds_i18n("mcp.install"));
+        cui_secondary(ui, ds_i18n("mcp.install_desc"));
 
         char client[1200];
         snprintf(client, sizeof client,
                  "{\n  \"mcpServers\": {\n    \"deepseek-audio\": {\n"
                  "      \"command\": \"%s\",\n      \"args\": []\n    }\n  }\n}",
                  mcp_path);
-        cui_code_block(ui, "mcp-client", client, .lang = "json", .title = "client config");
+        cui_code_block(ui, "mcp-client", client, .lang = "json", .title = ds_i18n("mcp.client_config"));
     }
 
     cui_card(ui, .width = CUI_FILL, .gap = 12) {
         cui_row(ui, .gap = 8) {
-            cui_heading(ui, "Self test", 4);
+            cui_heading(ui, ds_i18n("mcp.self_test"), 4);
             cui_spacer(ui);
-            if (cui_button(ui, selftest_ok ? "Run again" : "Run self test",
+            if (cui_button(ui, selftest_ok ? ds_i18n("mcp.run_again") : ds_i18n("mcp.run"),
                            .icon = CUI_ICON_TERMINAL))
                 run_selftest(ui, a);
         }
         if (!selftest_ok) {
-            cui_secondary(ui, "Runs the server binary with --selftest and shows its tools/list reply.");
+            cui_secondary(ui, ds_i18n("mcp.self_test_desc"));
         } else {
             cui_json_view(ui, "mcp-selftest", selftest, .expand_depth = 2);
         }
