@@ -110,10 +110,15 @@ dsaudio                           # the window
 
 The key is resolved in this order:
 
-1. `$DEEPSEEK_API_KEY` / `$DEEPSEEK_BASE_URL`
-2. `~/.config/dsaudio/config.json` (written by Settings in the app)
-3. `[providers.DeepSeek]` in `~/.kimi-code/config.toml` — the existing key, read
-   only, never written back
+1. `$DEEPSEEK_API_KEY`, and `$DEEPSEEK_BASE_URL` for the endpoint
+2. the platform credential store — macOS Keychain or Windows Credential
+   Manager; Linux has no portable store, so Settings writes
+   `~/.config/dsaudio/key` there with mode `0600`
+3. `~/.config/dsaudio/config.json`, written by Settings
+4. `[providers.DeepSeek]` in `~/.kimi-code/config.toml` — your existing key,
+   read only, never written back
+
+`dsaudio-cli config` prints which of these is in force.
 
 ## Install the MCP server
 
