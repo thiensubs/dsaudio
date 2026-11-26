@@ -97,6 +97,68 @@ static bool smoke_app_id_ok(cui_app *app) {
 }
 #endif
 
+#ifdef __APPLE__
+#include <objc/message.h>
+#include <objc/runtime.h>
+#include <signal.h>
+#include <unistd.h>
+static volatile int smoke_quitting;
+static void smoke_exit_guard(void) { if (smoke_quitting) { printf("quit from the menu: the process exited inside the event loop\n"); _exit(3); } }
+static void smoke_hang(int sig) { (void)sig; printf("quit from the menu: cui_app_frame did not return\n"); _exit(4); }
+/* Quit as the Dock or AppleScript sends it: terminate: arrives while the app waits for
+ * events, with no event of its own. cui_app_frame has to return false, and the process
+ * has to go on to the code after the loop. */
+static bool smoke_quit_menu(void) {
+    cui_app *app = cui_app_create(&(cui_app_desc){ .title = "CUI quit test", .width = 400, .height = 300 });
+    if (!app) return false;
+    id nsapp = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("NSApplication"), sel_registerName("sharedApplication"));
+    ((void (*)(id, SEL, SEL, id, double))objc_msgSend)(nsapp, sel_registerName("performSelector:withObject:afterDelay:"),
+                                                       sel_registerName("terminate:"), nil, 0.4);
+    atexit(smoke_exit_guard);
+    signal(SIGALRM, smoke_hang);
+    smoke_quitting = 1;
+    alarm(10);
+    int frames = 0;
+    while (cui_app_frame(app) && frames < 100000) { cui_text(cui_app_ui(app), "waiting for Quit"); frames++; }
+    alarm(0);
+    smoke_quitting = 0;
+    cui_app_destroy(app);
+    printf("quit from the menu: cui_app_frame returned after %d frames\n", frames);
+    return frames < 100000;
+}
+#endif
+
+/* cui_app_follow_system_theme (issue #34): stopping keeps a cui_set_theme from being
+ * undone by the OS setting, starting goes back to the OS setting at once. */
+static bool smoke_follow_theme(void) {
+    cui_app *app = cui_app_create(&(cui_app_desc){ .title = "CUI theme test", .width = 400, .height = 300,
+                                                   .continuous = true, .follow_system_theme = true });
+    if (!app) return false;
+    cui_ctx *ui = cui_app_ui(app);
+    cui_theme_mode os = cui_get_theme_mode(ui);          /* the OS setting, or light when unknown */
+    cui_theme_mode other = os == CUI_THEME_DARK ? CUI_THEME_LIGHT : CUI_THEME_DARK;
+    int frame = 0;
+    cui_theme_mode kept = os, back = os;
+    while (cui_app_frame(app) && frame < 40) {
+        if (frame == 2) { cui_app_follow_system_theme(NULL, false); cui_set_theme(ui, other); }   /* NULL: the running app */
+        if (frame == 20) kept = cui_get_theme_mode(ui);
+        if (frame == 21) cui_app_follow_system_theme(app, true);
+        if (frame == 22) back = cui_get_theme_mode(ui);
+        cui_text(ui, "theme");
+        frame++;
+    }
+    cui_app_destroy(app);
+    bool stop_ok = kept == other;
+#if defined(_WIN32) || defined(__APPLE__)
+    bool start_ok = back == os;                            /* these platforms always report a setting */
+#else
+    bool start_ok = back == os || back == other;           /* X11 may not know the setting (Xvfb) */
+#endif
+    printf("follow system theme: stop keeps the app's theme %s, start returns to the OS setting %s\n",
+           stop_ok ? "ok" : "FAILED", start_ok ? (back == os ? "ok" : "(OS setting unknown here)") : "FAILED");
+    return stop_ok && start_ok;
+}
+
 int main(int argc, char **argv) {
     const char *out = argc > 1 ? argv[1] : "app_smoke.png";
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -144,10 +206,30 @@ int main(int argc, char **argv) {
 #ifdef CUI_SMOKE_X11
     app_id_ok = smoke_app_id_ok(app);
 #endif
+    bool text_input_ok = true;
+#if defined(CUI_SMOKE_X11) && defined(CUI_SMOKE_SDL2)
+    /* typed characters reach type-ahead, the one-time code input and the hex editor
+     * without a text field focused, so SDL text input must stay on between fields */
+    text_input_ok = SDL_IsTextInputActive();
+    printf("SDL text input outside text fields: %s\n", text_input_ok ? "on" : "OFF");
+#endif
+#ifdef CUI_SMOKE_X11
+    /* An X server resets when its last client disconnects, and a window opened during the reset
+     * fails. Xvfb does this by default, so hold a connection while the next test's app starts. */
+    Display *keep = XOpenDisplay(NULL);
+#endif
     cui_app_destroy(app);
     /* a continuous app runs at the display's rate, not as fast as the machine can draw */
     double fps = t1 > t0 ? 39.0 / (t1 - t0) : 0;
     bool paced = fps > 0 && fps < 250;
     printf("animation: %.0f frames per second%s\n", fps, paced ? "" : " (not paced)");
-    return (ok && switched && paced && null_ok && app_id_ok) ? 0 : 1;
+    bool theme_ok = smoke_follow_theme();
+#ifdef CUI_SMOKE_X11
+    if (keep) XCloseDisplay(keep);
+#endif
+    bool quit_ok = true;
+#ifdef __APPLE__
+    quit_ok = smoke_quit_menu();
+#endif
+    return (ok && switched && paced && null_ok && app_id_ok && text_input_ok && theme_ok && quit_ok) ? 0 : 1;
 }

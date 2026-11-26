@@ -1,0 +1,3 @@
+upstream https://github.com/yappologistic/CUI
+commit f3ab64d
+version 1.5.0

@@ -238,7 +238,28 @@ cui_scroll(ui, .id = "messages", .gap = 8) {
 }
 ```
 
-A scroll area fills the remaining height of its parent by default, scrolls smoothly with the wheel or trackpad, and shows a thin scrollbar while scrolling or when hovered near the edge. The thumb can be dragged. Set `.horizontal = true` to scroll both ways. Jump with `cui_scroll_to(ui, "messages", 0)`.
+A scroll area fills the remaining height of its parent by default, scrolls smoothly with the wheel or trackpad, and shows a thin scrollbar while scrolling or when hovered near the edge. The thumb can be dragged. Set `.horizontal = true` to scroll both ways. A vertical-only area leaves horizontal wheel input available to its children. Jump with `cui_scroll_to(ui, "messages", 0)`.
+
+For keyboard selection in a list whose rows differ in height, `cui_scroll_reveal(ui, "messages", row)` keeps the selected row in view with the least movement. It compares the row's and the area's rectangles from the latest layout: when the row is wholly in view nothing moves, otherwise the list scrolls just enough to show the edge that was cut off, and a row taller than the area gets its top at the top. Before the first layout, when neither rectangle is known yet, it does nothing. Call it on the frame the selection changes, inside or before the area, from the id scope the area was named in (as with `cui_scroll_to`):
+
+```c
+static int sel;
+bool moved = false;
+if (cui_key_pressed(ui, CUI_KEY_DOWN) && sel < count - 1) { sel++; moved = true; }
+if (cui_key_pressed(ui, CUI_KEY_UP) && sel > 0) { sel--; moved = true; }
+cui_scroll(ui, .id = "messages", .gap = 8) {
+    for (int i = 0; i < count; i++) {
+        cui_push_id_int(ui, i);
+        cui_id row = cui_box_begin(ui, &(cui_box){ .id = "row", .width = CUI_FILL });
+        message_row(ui, i, i == sel);   /* any height: wrapped text, a heading */
+        cui_box_end(ui);
+        cui_pop_id(ui);
+        if (moved && i == sel) cui_scroll_reveal(ui, "messages", row);
+    }
+}
+```
+
+Over a wheel picker or ruler, vertical wheel input changes its value while it has room to move in that direction. At its limit the surrounding scroll area can receive the wheel.
 
 With `.fade_edges = true` the content fades out at an edge that has more to scroll, instead of being cut off. It works sideways too for `.horizontal` areas. The fade takes the color of the nearest opaque box around the scroll area (the page background if there is none); set `.fade_color` to override it. Source cards and the kanban board fade their overflow the same way.
 
@@ -262,7 +283,7 @@ cui_split(ui, "main", &ratio, .min_first = 220, .min_second = 360) {
 }
 ```
 
-The divider highlights on hover and can be dragged. Use `.vertical = true` to split top and bottom.
+The divider highlights on hover and can be dragged. Use `.vertical = true` to split top and bottom. When the pane minimums cannot both fit, they share the space in proportion to their requested sizes.
 
 ## Reading layout results
 

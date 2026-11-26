@@ -32,7 +32,7 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
       sha: ${{ steps.version.outputs.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
       - name: Version and notes from the changelog
@@ -81,12 +81,14 @@ jobs:
           - { os: macos-latest, name: macos-arm64 }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.release.outputs.sha }}
       - name: Install dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update -q && sudo apt-get install -y -q libx11-dev
+        timeout-minutes: 15
+        # older commits predate the script: install the plain way then
+        run: if [ -f .github/apt-install.sh ]; then sh .github/apt-install.sh libx11-dev; else sudo apt-get update -q && sudo apt-get install -y -q libx11-dev; fi
       - name: Build the examples
         shell: bash
         run: |

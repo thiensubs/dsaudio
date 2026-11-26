@@ -23,11 +23,11 @@ jobs:
     name: Build the site
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install clang and LLVM tools
+        timeout-minutes: 15
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q clang lld llvm
+          sh .github/apt-install.sh clang lld llvm
           # wasm-ld and llvm-ar live in the versioned LLVM folder
           echo "$(ls -d /usr/lib/llvm-*/bin | sort -V | tail -1)" >> "$GITHUB_PATH"
       - name: Build
@@ -38,8 +38,8 @@ jobs:
       - name: Collect the files
         # the site links to assets/fonts, docs/images and examples; copy them as real files
         run: cp -rL web/site _site
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/configure-pages@v6
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: _site
 
@@ -52,4 +52,4 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

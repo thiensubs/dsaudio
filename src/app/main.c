@@ -41,7 +41,7 @@ static void nav(cui_ctx *ui, app_state *a) {
         cui_theme_switcher(ui, &a->theme_mode, true);
         cui_gap(ui, 6);
         char ver[64];
-        snprintf(ver, sizeof ver, "C99 - CUI %s", "1.4.0");
+        snprintf(ver, sizeof ver, "C99 - CUI %s", CUI_VERSION_STRING);
         cui_muted(ui, ver);
     }
 }

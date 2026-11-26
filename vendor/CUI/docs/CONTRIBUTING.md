@@ -68,7 +68,7 @@ Use the issue forms on GitHub; they contain every section below. A complete repo
    - OS and version.
    - Compiler and version (`cc --version`).
    - CUI commit (`git rev-parse --short HEAD`).
-   - Window backend (`CUI_PLATFORM`: auto, win32, cocoa, x11, sdl2 or glfw).
+   - Window backend (`CUI_PLATFORM`: auto, win32, cocoa, x11, wayland, sdl2 or glfw).
    - Renderer (OpenGL, or `CUI_RENDERER=software`).
    - Display scale.
 4. **Steps to reproduce.** Ideally a minimal C program; most bugs fit in a `cui_app` loop of 20 lines. Otherwise the exact example and the clicks or keys that trigger it.
@@ -168,7 +168,7 @@ Open the images and look at them, in light and dark. Then copy into `docs/images
 
 ## Keeping the code readable
 
-CUI has about 190 components in plain C. That stays workable only if every file reads the same way, so these rules matter as much as the ones above. [How CUI is built](architecture.md) shows the outline every component follows and where things live.
+CUI has about 210 components in plain C. That stays workable only if every file reads the same way, so these rules matter as much as the ones above. [How CUI is built](architecture.md) shows the outline every component follows and where things live.
 
 **Where code goes**
 

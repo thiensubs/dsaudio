@@ -36,6 +36,10 @@ for (;;) {
 
 Coordinates are in points (logical pixels). `pixels_per_point` is 2 on a typical retina screen. Input events can arrive at any time between frames; CUI collects them for the next frame.
 
+Double-click timing uses the clock advanced by `cui_begin_frame`, so the first
+click after an idle interval is timed in the frame that receives it. Forward each
+press and release, including quick taps collected before the same frame.
+
 An idle CUI app costs nothing: with no input and nothing animating, `cui_needs_redraw` is false and the loop sleeps. Components that blink or wait (the caret, tooltips, toasts) set `cui_next_wakeup`. When your own content changes on a timer, such as a clock, a poll or messages arriving, call `cui_request_wakeup(ui, seconds)` during the frame. The loop then wakes for it instead of redrawing continuously. `cui_request_redraw` asks for the next frame right away, for things that change every frame.
 
 ### Input reference
@@ -50,6 +54,29 @@ An idle CUI app costs nothing: with no input and nothing animating, `cui_needs_r
 | `cui_input_text(ui, utf8)` | Typed characters after keyboard layout and IME processing |
 | `cui_input_focus(ui, focused)` | Window focus changes |
 
+### Component input
+
+`cui_set_input_hook` delivers events synchronously before CUI batches them.
+An observer can handle pointer motion, buttons, scrolling and focus changes
+while returning false so CUI controls still receive the same input. A hook
+that returns true owns delivery. Copy any text kept beyond the callback.
+
+A host that queues input can replay its pointer events through the normal
+entry points. For key, text and focus events, call `cui_dispatch_input` after
+`cui_begin_frame` and before submitting components. A route can handle an
+event or let CUI apply its default action. Unregister capture during replay.
+Submit a [focusable canvas](custom-components.md#keyboard-focus) with
+`.component_input = true` to receive keys through that route. On each event,
+use `cui_component_has_input(ui, id)` to check window and canvas focus and
+whether an overlay covers the canvas. Check on every event because a Tab
+you pass to CUI can move focus before the next event in the same batch.
+
+Inside the route, `cui_input_repeated` identifies repeated key-down events.
+`cui_key_down` reports the physical state. `cui_key_action_down` excludes
+keys whose presses were handled by the route. Committed text arrives as a
+separate event even if the route handled the preceding key press.
+Use `cui_focused_id` and `cui_window_focused` to inspect focus directly.
+
 ### Platform services
 
 ```c
@@ -59,10 +86,49 @@ cui_set_platform(ui, &(cui_platform_iface){
     .get_clipboard = my_get_clipboard,           /* returns a string valid until the next call */
     .set_cursor = my_set_cursor,                 /* CUI_CURSOR_ARROW, HAND, TEXT, RESIZE_EW... */
     .set_text_input_rect = my_set_ime_rect,      /* where the IME candidate window should go */
+    .window_frame = my_window_frame,             /* optional: the window has no system title bar */
+    .window_button = my_window_button,           /* optional: minimize, maximize, restore, close */
 });
 ```
 
+CUI calls `set_text_input_rect` every frame a text field has focus, with the caret in window points (top-left origin, one line tall). Place the input method's composition and candidate windows there; the built-in Win32, Cocoa, X11 and SDL2 backends and the docs site do.
+
+A window without the system's title bar, whose content draws one with `cui_title_bar`, needs two more hooks. `window_frame` writes whether the window is maximized and whether it can be resized, and returns true while the system's title bar is gone; without the hook, or when it returns false, `cui_title_bar` is a bar without window buttons. `window_button` carries out a click on minimize, maximize, restore or close. To move the window, the platform asks `cui_title_bar_hit_test(ui, x, y)` with a point in window points, for example in `WM_NCHITTEST` on Windows: `CUI_TITLE_BAR_CAPTION` is the bar's empty space and its title, which move the window and maximize it on a double click, `CUI_TITLE_BAR_MAXIMIZE` is the maximize button, where Windows 11 opens its snap layouts, and `CUI_TITLE_BAR_NONE` is everything else, the controls in the bar, a popup over it, and any point while a control is being dragged. The built-in Win32 backend sets both hooks when the app asks for `cui_app_desc.custom_title_bar`.
+
 Useful queries for your app: `cui_wants_keyboard` (a text field has focus), `cui_wants_mouse` (the pointer is over the UI), `cui_get_cursor`.
+
+A custom component can request a cursor with `cui_set_cursor` during submission
+or painting. The platform receives the last cursor requested that frame.
+The next frame starts with the arrow cursor.
+
+## Touch input
+
+A touch platform can feed the raw multi-touch API beside or instead of the
+mouse. Fingers are numbered by slot (0 to `CUI_TOUCH_MAX - 1`); your platform
+backend picks the slot, keeps it for the life of the touch and reports moves
+and lifts through it:
+
+```c
+cui_input_touch(ui, finger, down, x, y);   /* a finger lands or lifts */
+cui_input_touch_move(ui, finger, x, y);    /* it slides */
+cui_input_touch_cancel(ui, finger);        /* a system gesture steals it */
+```
+
+In the frame loop, `cui_touch_down`, `cui_touch_pressed` and
+`cui_touch_released` report the state and the per-frame edge flags (the edges
+hold for one frame, like the mouse ones), and `cui_touch_pos` returns the
+position. A finger that lifted keeps its last position for the frame it
+lifts, so `cui_touch_released` with `cui_touch_pos` places a tap. Pass -1 as
+the finger to ask about the touch that landed first; on the frame the last
+finger lifts, -1 is that finger, and when no finger is down or lifted,
+`cui_touch_down(-1)` is false and `cui_touch_pos(-1)` is off screen (-1e6).
+`cui_touch_count` reports how many fingers are down. The
+optional input hook (`cui_set_input_hook`) also sees touches, as
+`CUI_INPUT_TOUCH` and `CUI_INPUT_TOUCH_MOVE` events with the `finger` field
+set. Touch does not drive the mouse: a component that only listens to the mouse
+ignores it, so a touch-first app either uses components with explicit touch
+support or maps the first finger to the mouse itself (the built-in Android and
+iOS backends do the latter).
 
 ## Using the built-in backends with your loop
 
@@ -87,6 +153,17 @@ cui_sw_render(sw, cui_get_draw_data(ui), pixels, width, height, stride_bytes, CU
 
 Renders into any 32 bit buffer, using several threads. Output matches the GPU renderer to within a fraction of a percent. Great for servers, tests, thumbnails and embedded framebuffers. `cui_write_png` saves a buffer.
 
+### Direct3D 12, Vulkan, Metal
+
+```c
+cui_gpu_renderer *gpu = cui_gpu_create(window, true);   /* an HWND, a cui_x11_window *, an NSWindow * */
+cui_ctx *ui = cui_create(&(cui_ctx_desc){ .renderer = cui_gpu_iface(gpu) });
+...
+cui_gpu_render(gpu, cui_get_draw_data(ui));              /* draws and presents */
+```
+
+With `CUI_D3D12` (Windows), `CUI_VULKAN` (Linux) or `CUI_METAL` (macOS): the OpenGL renderer's shader, drawing into a swapchain or layer of its own on the window. The app layer picks it with `CUI_RENDERER_GPU`; [Performance](performance.md#direct3d-12-vulkan-and-metal-against-opengl) has the comparison.
+
 ### Your own renderer
 
 You need two things:
@@ -94,7 +171,7 @@ You need two things:
 1. **Textures.** Implement the three callbacks in `cui_renderer_iface`: create (R8 for the font atlas, RGBA8 for images), update a sub-rectangle, destroy. Return any nonzero handle.
 2. **One draw call per command.** For each `cui_draw_cmd` set the scissor rectangle to `clip` (pixels, top left origin), bind `texture` (0 means `font_atlas`) and draw `index_count` indices starting at `index_offset` as triangles. Blend with premultiplied alpha: `src * 1 + dst * (1 - src_alpha)`.
 
-The vertex format and the reference shader are in [rendering.md](rendering.md). Porting them to Vulkan, Metal, Direct3D 11/12, WebGPU, sokol or bgfx is mostly syntax.
+The vertex format and the reference shader are in [rendering.md](rendering.md). Porting them to WebGPU, sokol, bgfx or Direct3D 11 is mostly syntax; the Direct3D 12, Vulkan and Metal renderers in `src/render/` are three such ports.
 
 ## Threads
 
@@ -132,12 +209,12 @@ CUI is built to stay small. Measured with GCC, `-DCMAKE_BUILD_TYPE=MinSizeRel`, 
 
 | | Size |
 |---|---|
-| Whole library (about 190 components, both renderers, X11 backend, fonts) | about 1,050 KB |
+| Whole library (about 210 components, both renderers, X11 backend, fonts) | about 1,130 KB |
 | of which embedded fonts (Inter, Geist, Geist Mono, 168 Lucide icons) | 95 KB, compressed |
 | `examples/hello` on Linux, whole executable | about 250 KB |
 | `examples/hello.exe` on Windows (MinGW, linked with `-flto`), whole executable | about 300 KB |
-| `examples/assistant`, an AI chat app | about 350 KB |
-| `examples/gallery`, every component in use | about 1,010 KB |
+| `examples/assistant`, an AI chat app | about 360 KB |
+| `examples/gallery`, every component in use | about 1,140 KB |
 
 What keeps it small:
 

@@ -8,6 +8,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifdef CUI_TEST_WINDOWS_IMAGE_PATH
+#include <wchar.h>
+#endif
 
 static int g_failed, g_checks;
 #define CHECK(cond) do { g_checks++; if (!(cond)) { g_failed++; printf("  FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); } } while (0)
@@ -61,6 +64,46 @@ static void test_color(void) {
     CHECK(t.a == 0);
     cui_color a = cui_alpha(CUI_RGB(0x123456), 0.5f);
     CHECK(a.a == 128 && a.r == 0x12);
+}
+
+/* An allocator that fills the memory it adds with 0x01, as reused heap memory
+ * may be. The size lives in a header, so realloc knows which bytes are new. */
+static void *junk_alloc(size_t size, void *user) {
+    (void)user;
+    size_t *p = malloc(size + 16);
+    if (!p) return NULL;
+    p[0] = size;
+    memset((char *)p + 16, 0x01, size);
+    return (char *)p + 16;
+}
+static void *junk_realloc(void *ptr, size_t size, void *user) {
+    if (!ptr) return junk_alloc(size, user);
+    size_t *p = (size_t *)((char *)ptr - 16), old = p[0];
+    p = realloc(p, size + 16);
+    if (!p) return NULL;
+    p[0] = size;
+    if (size > old) memset((char *)p + 16 + old, 0x01, size - old);
+    return (char *)p + 16;
+}
+static void junk_free(void *ptr, void *user) { (void)user; if (ptr) free((char *)ptr - 16); }
+
+/* growing the state store rehashed before clearing the new slot, so leftover
+ * bytes there linked a phantom entry into a bucket and cut off its chain */
+static void test_state_store_grow(void) {
+    printf("state: values survive the store growing over reused memory\n");
+    cui_ctx *ui = cui_create(&(cui_ctx_desc){ .renderer = cui_sw_iface(g_sw), .allocator = { junk_alloc, junk_realloc, junk_free, NULL } });
+    /* an id picks its bucket by its low bits: 257 shares one with the leftover id 0x01010101 */
+    *(int *)cui_state(ui, 257, sizeof(int)) = 42;
+    bool kept = true;
+    for (cui_id k = 0; k < 5000 && kept; k++) {
+        cui_id id = 100000 + k;
+        if ((id & 0x7FF) == 257) continue;   /* the new entry itself must not land there (a lookup loop) */
+        *(int *)cui_state(ui, id, sizeof(int)) = (int)k;
+        kept = *(int *)cui_state(ui, 257, sizeof(int)) == 42;
+    }
+    CHECK(kept);
+    CHECK(*(int *)cui_state(ui, 100000 + 4000, sizeof(int)) == 4000);
+    cui_destroy(ui);
 }
 
 /* layout --------------------------------------------------------------- */
@@ -322,6 +365,41 @@ static void test_button_click(void) {
     cui_destroy(ui);
 }
 
+/** Render a primary button and sample its fill, clear of the label and border. */
+static int hover_button_frame(cui_ctx *ui, float elapsed) {
+    enum { width = 96, height = 48 };
+    unsigned char pixels[width * height * 4];
+    cui_begin_frame(ui, elapsed);
+    cui_button(ui, "Hover", .variant = CUI_BUTTON_PRIMARY, .width = CUI_PX(80));
+    cui_end_frame(ui);
+    cui_sw_render(g_sw, cui_get_draw_data(ui), pixels, width, height, width * 4, CUI_SW_RGBA);
+    return pixels[(16 * width + 8) * 4];
+}
+
+/** The first hover frame after a quiet second must show an intermediate fill. */
+static void test_button_hover_after_idle(void) {
+    cui_ctx *ui = new_ctx();
+    cui_set_viewport(ui, 96, 48, 1);
+    cui_set_reduced_motion(ui, false);
+    cui_input_mouse_move(ui, 95, 47);
+    const float frame = 1.0f / 60.0f;
+    hover_button_frame(ui, frame);
+    int rest = hover_button_frame(ui, frame);
+    CHECK(!cui_needs_redraw(ui));
+
+    double before = cui_time(ui);
+    cui_input_mouse_move(ui, 8, 16);
+    int first = hover_button_frame(ui, 1.0f);
+    CHECK_NEAR(cui_time(ui) - before, 1.0, 1e-6);
+    for (int i = 0; i < 20; i++) hover_button_frame(ui, frame);
+    int settled = hover_button_frame(ui, frame);
+    CHECK(!cui_needs_redraw(ui));
+    printf("button hover after 1 s idle: red channel at rest %d, first frame %d, settled %d\n",
+           rest, first, settled);
+    CHECK((rest < first && first < settled) || (settled < first && first < rest));
+    cui_destroy(ui);
+}
+
 static void test_keyboard_nav(void) {
     printf("interaction: tab focus and keyboard activation\n");
     cui_ctx *ui = new_ctx();
@@ -422,6 +500,106 @@ static void test_copy_button_focus(void) {
     cui_destroy(ui);
 }
 
+/* the clock takes the whole idle interval for timers, but not an absurd one: a first dt of
+ * "seconds since 1970" must not throw the clock where a float stops counting frames */
+static void test_clock_step_bound(void) {
+    printf("frame clock: idle intervals count, absurd ones are bounded\n");
+    cui_ctx *ui = new_ctx();
+    cui_begin_frame(ui, 1.0f / 60.0f); cui_end_frame(ui);
+    double t0 = cui_time(ui);
+    cui_begin_frame(ui, 2.5f); cui_end_frame(ui);              /* an idle wait of 2.5 s counts in full */
+    CHECK(fabs(cui_time(ui) - t0 - 2.5) < 1e-6);
+    double t1 = cui_time(ui);
+    cui_begin_frame(ui, 1.7e9f); cui_end_frame(ui);            /* now - 0 */
+    CHECK(cui_time(ui) - t1 <= 3600.0 + 1e-3);
+    cui_begin_frame(ui, -1.0f); cui_end_frame(ui);             /* negative and NaN count as no time */
+    cui_begin_frame(ui, NAN); cui_end_frame(ui);
+    CHECK(cui_time(ui) - t1 <= 3600.0 + 1e-3);
+    cui_destroy(ui);
+}
+
+/* cui_set_clipboard_text / cui_get_clipboard_text: the platform hooks, for menu items
+ * that copy or paste (issue #32) */
+static void test_clipboard_api(void) {
+    printf("clipboard: set and get through the platform hooks\n");
+    cui_ctx *ui = new_ctx();
+    g_clip[0] = '\0';
+    cui_set_clipboard_text(ui, "/home/ada/notes.txt");
+    CHECK(strcmp(g_clip, "/home/ada/notes.txt") == 0);
+    CHECK(strcmp(cui_get_clipboard_text(ui), "/home/ada/notes.txt") == 0);
+    cui_set_clipboard_text(ui, NULL);                 /* NULL leaves the clipboard alone */
+    CHECK(strcmp(g_clip, "/home/ada/notes.txt") == 0);
+    cui_destroy(ui);
+    /* no platform hooks: nothing happens, and getting gives an empty string */
+    cui_ctx *bare = cui_create(&(cui_ctx_desc){ .renderer = cui_sw_iface(g_sw) });
+    cui_set_clipboard_text(bare, "ignored");
+    CHECK(cui_get_clipboard_text(bare) != NULL && cui_get_clipboard_text(bare)[0] == '\0');
+    CHECK(strcmp(g_clip, "/home/ada/notes.txt") == 0);
+    cui_destroy(bare);
+}
+
+/* Nav items: the group's highlight follows the selected item, and goes away
+ * when no item of the group is selected (issue #35). */
+typedef struct { int sel; bool click; cui_id item[3]; } nav_ctx;
+static void build_nav(cui_ctx *ui, void *u) {
+    nav_ctx *n = u;
+    static const char *const names[] = { "Inbox", "Projects", "Calendar" };
+    cui_column(ui, .pad = 20, .gap = 4, .width = CUI_PX(240)) {
+        for (int k = 0; k < 3; k++) {
+            /* as apps write it: the selection changes when the item reports a click */
+            if (cui_nav_item(ui, names[k], .selected = n->sel == k) && n->click) n->sel = k;
+            n->item[k] = cui_last_id(ui);
+        }
+    }
+}
+/* is the row's left edge painted (the highlight) rather than the background? */
+static bool nav_lit(cui_ctx *ui, cui_id id) {
+    const cui_draw_data *dd = cui_get_draw_data(ui);
+    int w = dd->width_px, h = dd->height_px;
+    unsigned char *px = malloc((size_t)w * h * 4);
+    cui_sw_render(g_sw, dd, px, w, h, w * 4, CUI_SW_RGBA);
+    cui_rect r = rect_of(ui, id);
+    int x = (int)(r.x + 4), y = (int)(r.y + r.h / 2), bx = 600, by = 500;
+    const unsigned char *a = px + ((size_t)y * w + x) * 4, *b = px + ((size_t)by * w + bx) * 4;
+    bool lit = abs(a[0] - b[0]) + abs(a[1] - b[1]) + abs(a[2] - b[2]) > 6;
+    free(px);
+    return lit;
+}
+static void test_nav_highlight(void) {
+    printf("nav items: highlight follows the selection, and leaves with it\n");
+    cui_ctx *ui = new_ctx();
+    cui_input_mouse_move(ui, 790, 590);   /* away from the items: no hover */
+    nav_ctx n = { .sel = 0 };
+    run(ui, build_nav, &n, 4);
+    CHECK(nav_lit(ui, n.item[0]) && !nav_lit(ui, n.item[1]) && !nav_lit(ui, n.item[2]));
+    n.sel = -1;                            /* a page that is not in the sidebar */
+    run(ui, build_nav, &n, 4);
+    CHECK(!nav_lit(ui, n.item[0]) && !nav_lit(ui, n.item[1]) && !nav_lit(ui, n.item[2]));
+    n.sel = 2;                             /* back in the sidebar, on another item */
+    run(ui, build_nav, &n, 4);
+    CHECK(!nav_lit(ui, n.item[0]) && !nav_lit(ui, n.item[1]) && nav_lit(ui, n.item[2]));
+    n.sel = 1;                             /* moving between items still works */
+    run(ui, build_nav, &n, 4);
+    CHECK(!nav_lit(ui, n.item[0]) && nav_lit(ui, n.item[1]) && !nav_lit(ui, n.item[2]));
+    cui_destroy(ui);
+    /* with motion: clicking an item above the selected one glides the highlight over the
+     * item between. The click frame has none selected, which must not reset the glide. */
+    ui = new_ctx();
+    cui_set_reduced_motion(ui, false);
+    nav_ctx c = { .sel = 2, .click = true };
+    run(ui, build_nav, &c, 60);
+    cui_rect r0 = rect_of(ui, c.item[0]);
+    click_at(ui, build_nav, &c, r0.x + r0.w / 2, r0.y + r0.h / 2);
+    cui_input_mouse_move(ui, 790, 590);
+    bool passed_middle = false;
+    for (int f = 0; f < 30 && !passed_middle; f++) { run(ui, build_nav, &c, 1); passed_middle = nav_lit(ui, c.item[1]); }
+    CHECK(c.sel == 0);
+    CHECK(passed_middle);
+    run(ui, build_nav, &c, 60);
+    CHECK(nav_lit(ui, c.item[0]) && !nav_lit(ui, c.item[1]) && !nav_lit(ui, c.item[2]));
+    cui_destroy(ui);
+}
+
 /* A click focuses without a ring; the next key shows the ring and acts on
  * that control, unless an open popup above it owns the keyboard. */
 typedef struct { int clicks, sel; cui_id button, select; } ck_ctx;
@@ -464,6 +642,51 @@ static void type(cui_ctx *ui, build_fn fn, void *u, const char *s) {
     cui_input_key(ui, CUI_KEY_NONE, false, 0);   /* typing happens without modifiers */
     cui_input_text(ui, s);
     run(ui, fn, u, 1);
+}
+
+typedef struct { char text[16]; bool disabled, next_clicked; } password_reveal_ctx;
+
+static void build_password_reveal(cui_ctx *ui, void *user) {
+    password_reveal_ctx *p = user;
+    cui_input(ui, "Password", p->text, sizeof p->text, .password = true, .disabled = p->disabled);
+    p->next_clicked = cui_button(ui, "Next");
+}
+
+/** Sample the text pixels separately from the reveal button and its tooltip. */
+static uint64_t password_text_pixels(cui_ctx *ui) {
+    enum { width = 320, height = 100, stride = width * 4 };
+    unsigned char pixels[height * stride];
+    cui_sw_render(g_sw, cui_get_draw_data(ui), pixels, width, height, stride, CUI_SW_RGBA);
+    uint64_t hash = 0;
+    for (int y = 4; y < 32; y++) {
+        for (int x = 12; x < 120; x++) {
+            for (int channel = 0; channel < 3; channel++) hash = hash * 31 + pixels[y * stride + 4 * x + channel];
+        }
+    }
+    return hash;
+}
+
+/** A disabled eye ignores clicks and leaves the next button first in tab order. */
+static void test_disabled_password_reveal(void) {
+    printf("password field: a disabled reveal button cannot unmask text\n");
+    for (int disabled = 0; disabled < 2; disabled++) {
+        cui_ctx *ui = new_ctx();
+        cui_set_viewport(ui, 320, 100, 1);
+        password_reveal_ctx p = { "sample", disabled != 0, false };
+        run(ui, build_password_reveal, &p, 2);
+        uint64_t masked = password_text_pixels(ui);
+        click_at(ui, build_password_reveal, &p, 301, 16);
+        run(ui, build_password_reveal, &p, 1);
+        CHECK((password_text_pixels(ui) == masked) == p.disabled);
+        cui_destroy(ui);
+    }
+    cui_ctx *ui = new_ctx();
+    password_reveal_ctx p = { "sample", true, false };
+    run(ui, build_password_reveal, &p, 1);
+    key(ui, build_password_reveal, &p, CUI_KEY_TAB, 0);
+    key(ui, build_password_reveal, &p, CUI_KEY_ENTER, 0);
+    CHECK(p.next_clicked);
+    cui_destroy(ui);
 }
 
 static void test_text_input(void) {
@@ -519,6 +742,48 @@ static void test_text_input(void) {
     cui_destroy(ui);
 }
 
+/* An empty field still has a caret. At offset 0 the bar stands just left of the
+ * text, in the field's padding, where the text clip used to cut it away. */
+typedef struct { char buf[64]; cui_id id; } blank_ctx;
+static void build_blank_field(cui_ctx *ui, void *u) {
+    blank_ctx *e = u;
+    cui_column(ui, .pad = 20) {
+        cui_input(ui, "empty", e->buf, sizeof e->buf, .width = CUI_PX(300));
+        e->id = cui_last_id(ui);
+    }
+}
+
+static int dark_pixels(cui_ctx *ui) {
+    const cui_draw_data *dd = cui_get_draw_data(ui);
+    size_t n = (size_t)dd->width_px * dd->height_px;
+    unsigned char *px = malloc(n * 4);
+    cui_sw_render(g_sw, dd, px, dd->width_px, dd->height_px, dd->width_px * 4, CUI_SW_RGBA);
+    int dark = 0;
+    for (size_t i = 0; i < n; i++) if (px[i * 4] + px[i * 4 + 1] + px[i * 4 + 2] < 300) dark++;
+    free(px);
+    return dark;
+}
+
+static void test_empty_field_caret(void) {
+    printf("text input: an empty field draws a caret, and it blinks\n");
+    cui_ctx *ui = new_ctx();
+    blank_ctx e;
+    memset(&e, 0, sizeof e);
+    run(ui, build_blank_field, &e, 2);
+    cui_vec2 c = center(rect_of(ui, e.id));
+    click_at(ui, build_blank_field, &e, c.x, c.y);
+    CHECK(e.buf[0] == 0);
+    int lo = -1, hi = 0;
+    for (int i = 0; i < 70; i++) {   /* a little over one blink period */
+        run(ui, build_blank_field, &e, 1);
+        int dark = dark_pixels(ui);
+        if (lo < 0 || dark < lo) lo = dark;
+        if (dark > hi) hi = dark;
+    }
+    CHECK(hi > lo + 8);   /* the bar comes and goes inside the field */
+    cui_destroy(ui);
+}
+
 typedef struct { char buf[512]; char other[32]; int flags; cui_id id, other_id; } area_ctx;
 static void build_area(cui_ctx *ui, void *u) {
     area_ctx *a = u;
@@ -539,6 +804,83 @@ static uint32_t frame_hash(cui_ctx *ui) {
     for (size_t i = 0; i < n; i++) h = (h ^ px[i]) * 16777619u;
     free(px);
     return h;
+}
+
+/** Check that a settled indicator holds still with reduced motion and resumes normally. */
+static void check_indicator_motion(build_fn build) {
+    cui_ctx *ui = new_ctx();
+    cui_set_viewport(ui, 480, 240, 1);
+    cui_input_mouse_leave(ui);
+    run(ui, build, NULL, 12);
+    uint32_t still = frame_hash(ui);
+    CHECK(!cui_needs_redraw(ui));
+    run(ui, build, NULL, 9);
+    CHECK(frame_hash(ui) == still);
+    CHECK(!cui_needs_redraw(ui));
+
+    cui_set_reduced_motion(ui, false);
+    run(ui, build, NULL, 12);
+    uint32_t moving = frame_hash(ui);
+    CHECK(cui_needs_redraw(ui));
+    run(ui, build, NULL, 9);
+    CHECK(frame_hash(ui) != moving);
+    cui_destroy(ui);
+}
+
+/** Draw the typing indicator on its own so redraws are attributable to its dots. */
+static void build_typing_indicator(cui_ctx *ui, void *unused) {
+    (void)unused;
+    cui_typing_indicator(ui, "Jonas");
+}
+
+/** Reduced motion keeps the typing dots visible and still. */
+static void test_typing_indicator_motion(void) {
+    printf("typing indicator: reduced motion\n");
+    check_indicator_motion(build_typing_indicator);
+}
+
+/** Exercise a running plan step without any other animated controls. */
+static void build_running_plan_step(cui_ctx *ui, void *unused) {
+    (void)unused;
+    static const cui_plan_step step = { "Reading", NULL, CUI_TASK_RUNNING };
+    cui_agent_plan(ui, "plan", &step, 1);
+}
+
+/** Exercise the running glyph through its tool call entry point. */
+static void build_running_tool_call(cui_ctx *ui, void *unused) {
+    (void)unused;
+    cui_tool_call(ui, "tool", "Read file", .status = CUI_TASK_RUNNING);
+}
+
+/** Both callers of the running task glyph respect reduced motion. */
+static void test_running_task_motion(void) {
+    printf("running plan step: reduced motion\n");
+    check_indicator_motion(build_running_plan_step);
+    printf("running tool call: reduced motion\n");
+    check_indicator_motion(build_running_tool_call);
+}
+
+/** Exercise the plain spinner as used for a running pipeline job. */
+static void build_running_pipeline(cui_ctx *ui, void *unused) {
+    (void)unused;
+    static const char *const stages[] = { "Build" };
+    static const cui_pipeline_job job = { "Windows", 0, CUI_JOB_RUNNING, 1.0f, false };
+    cui_pipeline(ui, "pipeline", stages, 1, &job, 1);
+}
+
+/** Exercise the plain spinner as used for a running test. */
+static void build_running_test(cui_ctx *ui, void *unused) {
+    (void)unused;
+    static const cui_test_item items[] = { { "Suite", 0 }, { "Layout", 1, CUI_JOB_RUNNING, -1 } };
+    cui_test_explorer(ui, "tests", items, 2, .height = 180);
+}
+
+/** Both developer views hold their running indicator still with reduced motion. */
+static void test_running_job_motion(void) {
+    printf("running pipeline job: reduced motion\n");
+    check_indicator_motion(build_running_pipeline);
+    printf("running test: reduced motion\n");
+    check_indicator_motion(build_running_test);
 }
 
 static void test_textarea_and_clear(void) {
@@ -580,6 +922,700 @@ static void test_textarea_and_clear(void) {
     cui_destroy(ui);
 }
 
+static cui_rect g_ime_caret;
+static int g_ime_calls;
+static void ime_rect(void *u, cui_rect r) { (void)u; g_ime_caret = r; g_ime_calls++; }
+
+static void test_textarea_ime_caret(void) {
+    printf("text area: the IME is told the caret's line, not the whole area\n");
+    cui_ctx *ui = new_ctx();
+    cui_set_platform(ui, &(cui_platform_iface){ .set_clipboard = clip_set, .get_clipboard = clip_get, .set_text_input_rect = ime_rect });
+    area_ctx a;
+    memset(&a, 0, sizeof a);
+    strcpy(a.buf, "one\ntwo\nthree");
+    run(ui, build_area, &a, 2);
+    CHECK(g_ime_calls == 0);   /* nothing focused */
+    cui_rect area = rect_of(ui, a.id);
+    click_at(ui, build_area, &a, area.x + 12, area.y + 10);   /* on the first line */
+    CHECK(g_ime_calls > 0);
+    cui_rect first = g_ime_caret;
+    CHECK(first.h > 0 && first.h < area.h / 2);
+    CHECK(first.y >= area.y && first.y + first.h <= area.y + area.h);
+    key(ui, build_area, &a, CUI_KEY_DOWN, 0);
+    cui_rect second = g_ime_caret;
+    CHECK_NEAR(second.y - first.y, first.h, 0.01);   /* one line lower, as tall */
+    CHECK_NEAR(second.h, first.h, 0.01);
+    key(ui, build_area, &a, CUI_KEY_DOWN, 0);
+    key(ui, build_area, &a, CUI_KEY_END, 0);
+    cui_rect third = g_ime_caret;
+    CHECK_NEAR(third.y - first.y, 2 * first.h, 0.01);
+    CHECK(third.x > first.x + 10);   /* after "three" */
+    key(ui, build_area, &a, CUI_KEY_ENTER, 0);   /* a new, empty last line */
+    CHECK(strcmp(a.buf, "one\ntwo\nthree\n") == 0);
+    CHECK(g_ime_caret.y > third.y);   /* the area scrolls to keep it in view */
+    CHECK(g_ime_caret.y + g_ime_caret.h <= area.y + area.h);
+    CHECK(g_ime_caret.x < first.x + 12);
+    cui_destroy(ui);
+}
+
+/** Put a scrollable editor inside a viewport with room to scroll both ways. */
+static void build_nested_textarea(cui_ctx *ui, void *user) {
+    area_ctx *a = user;
+    cui_scroll(ui, .id = "page", .height = CUI_PX(180), .width = CUI_PX(320), .horizontal = true) {
+        cui_box(ui, .height = CUI_PX(80)) {}
+        cui_textarea(ui, "notes", a->buf, sizeof a->buf, .height = 80);
+        a->id = cui_last_id(ui);
+        cui_box(ui, .width = CUI_PX(520), .height = CUI_PX(400)) {}
+    }
+}
+
+/** Keep the editor in place until the wheel points past one of its edges. */
+static void test_nested_textarea_wheel(void) {
+    printf("text area: wheel routing in a scrolling page\n");
+    cui_ctx *ui = new_ctx();
+    area_ctx a = { .buf = "One\nTwo\nThree\nFour\nFive\nSix\nSeven\nEight\nNine\nTen" };
+    run(ui, build_nested_textarea, &a, 2);
+    cui_scroll_to(ui, "page", 40);
+    run(ui, build_nested_textarea, &a, 2);
+    const cui_rect before = rect_of(ui, a.id);
+    cui_input_mouse_move(ui, before.x + before.w / 2, before.y + before.h / 2);
+    run(ui, build_nested_textarea, &a, 1);
+    const uint32_t unscrolled = frame_hash(ui);
+
+    cui_input_scroll(ui, 0, -1);
+    run(ui, build_nested_textarea, &a, 1);
+    const cui_rect after = rect_of(ui, a.id);
+    CHECK_NEAR(after.y, before.y, 0.01);
+    CHECK(frame_hash(ui) != unscrolled);
+
+    if (fabsf(after.y - before.y) < 0.01f) {
+        cui_input_scroll(ui, 0, -100);
+        run(ui, build_nested_textarea, &a, 1);
+        CHECK_NEAR(rect_of(ui, a.id).y, before.y, 0.01);
+        cui_input_scroll(ui, 0, -1);
+        run(ui, build_nested_textarea, &a, 1);
+        const float lower_edge = rect_of(ui, a.id).y;
+        CHECK(lower_edge < before.y);
+        cui_input_mouse_move(ui, before.x + before.w / 2, lower_edge + before.h / 2);
+        cui_input_scroll(ui, 0, 100);
+        run(ui, build_nested_textarea, &a, 1);
+        CHECK_NEAR(rect_of(ui, a.id).y, lower_edge, 0.01);
+        cui_input_scroll(ui, 0, 1);
+        run(ui, build_nested_textarea, &a, 1);
+        CHECK(rect_of(ui, a.id).y > lower_edge);
+    }
+    cui_destroy(ui);
+}
+
+/** A canvas in a scrolling page that takes the wheel over its left half. */
+typedef struct { cui_id canvas, wheel; bool region, disabled; int takes; cui_vec2 got; } wheel_canvas;
+static void paint_wheel_canvas(cui_ctx *ui, cui_rect r, void *user) {
+    const wheel_canvas *w = user;
+    if (w->region) cui_wheel_region(ui, w->wheel, (cui_rect){ r.x, r.y, r.w / 2, r.h });
+    CHECK(cui_is_disabled(ui) == w->disabled);      /* paint sees the scope the canvas was built in */
+}
+static void build_wheel_canvas(cui_ctx *ui, void *user) {
+    wheel_canvas *w = user;
+    cui_scroll(ui, .id = "page", .height = CUI_PX(180), .width = CUI_PX(320)) {
+        cui_box(ui, .height = CUI_PX(40)) {}
+        w->wheel = cui_make_id(ui, "zoom");
+        cui_push_disabled(ui, w->disabled);
+        cui_canvas(ui, "art", CUI_PX(300), CUI_PX(100), paint_wheel_canvas, w, sizeof *w);
+        w->canvas = cui_last_id(ui);
+        cui_vec2 d = { 0, 0 };                      /* taken in the canvas's own scope */
+        if (cui_wheel_take(ui, w->wheel, &d)) {
+            w->takes++;
+            w->got = d;
+            CHECK(!cui_wheel_take(ui, w->wheel, &d));   /* consumed */
+        }
+        cui_pop_disabled(ui);
+        cui_box(ui, .height = CUI_PX(400)) {}
+    }
+}
+
+/* Mimic a renderer whose unpack row length is in whole pixels (OpenGL), while
+ * using the software rasterizer so this test needs no window or GL context. */
+static void image_update_pixel_stride(void *sw, cui_texture tex, int x, int y, int w, int h, const void *data, int stride) {
+    cui_sw_iface(sw).texture_update(sw, tex, x, y, w, h, data, (stride / 4) * 4);
+}
+
+static void test_image_update(void) {
+    printf("image: padded RGBA8 subrect updates and idle redraw\n");
+    cui_sw_renderer *sw = cui_sw_create();
+    cui_renderer_iface renderer = cui_sw_iface(sw);
+    renderer.texture_update = image_update_pixel_stride;
+    cui_sw_set_incremental(sw, true);
+    cui_ctx *ui = cui_create(&(cui_ctx_desc){ .renderer = renderer });
+    cui_set_viewport(ui, 4, 4, 1);
+    uint8_t white[4 * 4 * 4], fb[sizeof white] = { 0 };
+    memset(white, 255, sizeof white);
+    cui_texture tex = cui_image_create(ui, 4, 4, white);
+    CHECK(tex != 0);
+    for (int i = 0; i < 3; i++) {   /* let layout settle and leave the original image on screen */
+        cui_begin_frame(ui, 1.0f / 60.0f);
+        cui_image(ui, tex, .width = CUI_PX(4), .height = CUI_PX(4));
+        cui_end_frame(ui);
+        cui_sw_render(sw, cui_get_draw_data(ui), fb, 4, 4, 16, CUI_SW_RGBA);
+    }
+    CHECK(memcmp(fb, white, sizeof fb) == 0);
+    cui_image_update(NULL, tex, 0, 0, 4, 4, white, 0);
+    cui_image_update(ui, 0, 0, 0, 4, 4, white, 0);
+    cui_image_update(ui, tex, 0, 0, 0, 4, white, 0);
+    cui_image_update(ui, tex, 0, 0, 4, 4, white, 15);    /* not enough bytes for one row */
+    CHECK(!cui_needs_redraw(ui));
+
+    /* Red and green above blue and yellow; padding is not a pixel. */
+    const uint8_t rows[2][9] = { { 255,0,0,255, 0,255,0,255, 17 }, { 0,0,255,255, 255,255,0,255, 31 } };
+    cui_image_update(ui, tex, 1, 1, 2, 2, rows, sizeof rows[0]);
+    CHECK(cui_needs_redraw(ui));
+    cui_sw_render(sw, cui_get_draw_data(ui), fb, 4, 4, 16, CUI_SW_RGBA);
+    for (int y = 0; y < 4; y++) for (int x = 0; x < 4; x++) {
+        const uint8_t *want = (y == 1 || y == 2) && (x == 1 || x == 2) ? &rows[y-1][4*(x-1)] : white;
+        CHECK(memcmp(fb + 4*(y*4 + x), want, 4) == 0);
+    }
+    cui_image_update(ui, tex, 0, 0, 4, 4, white, 0);    /* packed full update */
+    cui_sw_render(sw, cui_get_draw_data(ui), fb, 4, 4, 16, CUI_SW_RGBA);
+    CHECK(memcmp(fb, white, sizeof fb) == 0);
+    cui_image_destroy(ui, tex);
+    cui_destroy(ui);
+    cui_sw_destroy(sw);
+}
+
+typedef struct frame_alloc_canvas_data {
+    const char *label;
+    int *saw_match;
+} frame_alloc_canvas_data;
+
+static void paint_frame_alloc_canvas(cui_ctx *ui, cui_rect r, void *user) {
+    const frame_alloc_canvas_data *d = user;
+    (void)r;
+    if (d->label && strcmp(d->label, "ephemeral-42") == 0) (*d->saw_match)++;
+    cui_draw_text(ui, CUI_FONT_MONO, 12.0f, (cui_vec2){ r.x, r.y }, (cui_color){ 255, 255, 255, 255 }, d->label, -1);
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+static void add_ephemeral_canvas(cui_ctx *ui, int *saw_match) {
+    char tmp[32];
+    snprintf(tmp, sizeof tmp, "ephemeral-%d", 42);
+    frame_alloc_canvas_data d = { .label = cui_frame_strdup(ui, tmp), .saw_match = saw_match };
+    cui_canvas(ui, "ephemeral_canvas", CUI_PX(120), CUI_PX(40), paint_frame_alloc_canvas, &d, sizeof d);
+}
+
+static void test_canvas_frame_alloc(void) {
+    printf("canvas: cui_frame_alloc and cui_frame_strdup survive deferred paint\n");
+    cui_ctx *ui = new_ctx();
+    CHECK(cui_frame_alloc(NULL, 16) == NULL);
+    CHECK(cui_frame_alloc(ui, 0) == NULL);
+    CHECK(cui_frame_strdup(ui, NULL) == NULL);
+
+    int saw_match = 0;
+    cui_begin_frame(ui, 1.0f / 60.0f);
+    CHECK(cui_frame_alloc(ui, SIZE_MAX - 15) == NULL);
+    CHECK(cui_frame_alloc(ui, 32) != NULL);
+    cui_end_frame(ui);
+    cui_begin_frame(ui, 1.0f / 60.0f);  /* last frame's demand gave the arena its main block */
+    unsigned char *buf = cui_frame_alloc(ui, 32);
+    CHECK(buf != NULL && buf[0] == 0 && buf[31] == 0);
+    /* Reject unrepresentable requests without consuming or overwriting frame memory. */
+    if (buf) buf[0] = 42;
+    CHECK(cui_frame_alloc(ui, SIZE_MAX) == NULL);
+    CHECK(cui_frame_alloc(ui, SIZE_MAX - 15) == NULL);
+    unsigned char *next = cui_frame_alloc(ui, 16);
+    CHECK(buf && next == buf + 32 && buf[0] == 42 && next[0] == 0);
+    add_ephemeral_canvas(ui, &saw_match);
+    cui_end_frame(ui);
+    CHECK(saw_match == 1);
+
+    cui_destroy(ui);
+}
+
+typedef struct focus_scope_state {
+    int active_pane;
+    int hit; /* 1=A1, 2=A2, 3=B1, 4=B2 */
+} focus_scope_state;
+
+static void build_focus_scope_scene(cui_ctx *ui, void *u) {
+    focus_scope_state *s = u;
+    cui_id s0 = cui_make_id(ui, "pane0");
+    cui_id s1 = cui_make_id(ui, "pane1");
+    cui_focus_scope(ui, s0, s->active_pane == 0) {
+        if (cui_button(ui, "A1")) s->hit = 1;
+        if (cui_button(ui, "A2")) s->hit = 2;
+    }
+    cui_focus_scope(ui, s1, s->active_pane == 1) {
+        if (cui_button(ui, "B1")) s->hit = 3;
+        if (cui_button(ui, "B2")) s->hit = 4;
+    }
+}
+
+static void test_focus_scope(void) {
+    printf("focus: cui_push_focus_scope restricts Tab cycling to the active pane\n");
+    cui_ctx *ui = new_ctx();
+    focus_scope_state s = { .active_pane = 0 };
+    run(ui, build_focus_scope_scene, &s, 2);
+
+    /* Tab cycles strictly A1 -> A2 -> A1 while pane 0 is active */
+    const int expect0[3] = { 1, 2, 1 };
+    for (int i = 0; i < 3; i++) {
+        cui_input_key(ui, CUI_KEY_TAB, true, 0);
+        run(ui, build_focus_scope_scene, &s, 1);
+        s.hit = 0;
+        cui_input_key(ui, CUI_KEY_ENTER, true, 0);
+        run(ui, build_focus_scope_scene, &s, 1);
+        CHECK(s.hit == expect0[i]);
+    }
+
+    /* Switching active scope to pane 1 makes Tab cycle strictly B1 -> B2 -> B1 */
+    s.active_pane = 1;
+    run(ui, build_focus_scope_scene, &s, 1);
+    const int expect1[3] = { 3, 4, 3 };
+    for (int i = 0; i < 3; i++) {
+        cui_input_key(ui, CUI_KEY_TAB, true, 0);
+        run(ui, build_focus_scope_scene, &s, 1);
+        s.hit = 0;
+        cui_input_key(ui, CUI_KEY_ENTER, true, 0);
+        run(ui, build_focus_scope_scene, &s, 1);
+        CHECK(s.hit == expect1[i]);
+    }
+
+    cui_destroy(ui);
+}
+
+/* #111's focusable canvases inside #115's focus scopes: Tab, from a frame or from
+ * cui_dispatch_input, reaches only the active pane's canvas. */
+typedef struct { int active_pane; cui_id canvas[2]; } scope_canvas_state;
+
+static bool scope_canvas_route(cui_ctx *ui, void *user, const cui_input_event *e) { (void)ui; (void)user; (void)e; return false; }
+
+static void build_scope_canvas(cui_ctx *ui, void *u) {
+    scope_canvas_state *s = u;
+    const cui_canvas_opts opts = { .focusable = true, .component_input = true };
+    for (int k = 0; k < 2; k++) {
+        cui_focus_scope(ui, cui_make_id(ui, k ? "pane1" : "pane0"), s->active_pane == k) {
+            cui_canvas_ex(ui, k ? "canvas1" : "canvas0", CUI_PX(40), CUI_PX(20), NULL, NULL, 0, &opts);
+            s->canvas[k] = cui_last_id(ui);
+        }
+    }
+}
+
+static void test_focus_scope_canvas(void) {
+    printf("focus: Tab and ordered dispatch reach only the active pane's canvas\n");
+    cui_ctx *ui = new_ctx();
+    scope_canvas_state s = { .active_pane = 1 };
+    run(ui, build_scope_canvas, &s, 2);
+    for (int i = 0; i < 2; i++) {
+        cui_input_key(ui, CUI_KEY_TAB, true, 0);
+        cui_input_key(ui, CUI_KEY_TAB, false, 0);
+        run(ui, build_scope_canvas, &s, 1);
+        CHECK(cui_focused_id(ui) == s.canvas[1]);
+        CHECK(cui_component_has_input(ui, s.canvas[1]) && !cui_component_has_input(ui, s.canvas[0]));
+    }
+    s.active_pane = 0;
+    run(ui, build_scope_canvas, &s, 1);
+    const cui_input_event down = { .kind = CUI_INPUT_KEY, .key = CUI_KEY_TAB, .down = true };
+    const cui_input_event up = { .kind = CUI_INPUT_KEY, .key = CUI_KEY_TAB, .down = false };
+    for (int i = 0; i < 2; i++) {
+        cui_begin_frame(ui, 1.0f / 60.0f);
+        cui_dispatch_input(ui, &down, scope_canvas_route, NULL);
+        cui_dispatch_input(ui, &up, scope_canvas_route, NULL);
+        build_scope_canvas(ui, &s);
+        cui_end_frame(ui);
+        CHECK(cui_focused_id(ui) == s.canvas[0]);
+        CHECK(cui_component_has_input(ui, s.canvas[0]) && !cui_component_has_input(ui, s.canvas[1]));
+    }
+    cui_destroy(ui);
+}
+
+typedef struct {
+    bool active, nested;
+    int depth, hit;
+} nested_scope_case;
+
+static void build_nested_focus(cui_ctx *ui, void *u) {
+    nested_scope_case *s = u;
+    if (cui_button(ui, "Outside")) s->hit = 1;
+    cui_focus_scope(ui, 1, s->active) { if (cui_button(ui, "Pane")) s->hit = 2; }
+    if (s->nested) {
+        cui_focus_scope(ui, 2, false) {
+            /* Even a child with the active pane's id must stay out of Tab order here. */
+            cui_focus_scope(ui, 1, true) { if (cui_button(ui, "Child")) s->hit = 3; }
+        }
+    }
+    if (s->depth) {
+        for (int i = 1; i <= s->depth; i++) cui_push_focus_scope(ui, (cui_id)i, true);
+        cui_focus_scope(ui, 99, false) { if (cui_button(ui, "Skipped")) s->hit = 4; }
+        if (cui_button(ui, "Restored")) s->hit = 5;
+        for (int i = 0; i < s->depth; i++) cui_pop_focus_scope(ui);
+    }
+}
+
+static int tab_and_activate(cui_ctx *ui, nested_scope_case *s, int mods) {
+    s->hit = 0;
+    key(ui, build_nested_focus, s, CUI_KEY_TAB, mods);
+    key(ui, build_nested_focus, s, CUI_KEY_ENTER, 0);
+    return s->hit;
+}
+
+static void test_nested_focus(void) {
+    printf("focus: inactive panes, nested activation and balanced deep scopes\n");
+    cui_ctx *ui = new_ctx();
+    nested_scope_case s = { 0 };
+    run(ui, build_nested_focus, &s, 2);
+    CHECK(tab_and_activate(ui, &s, 0) == 1);
+    CHECK(tab_and_activate(ui, &s, CUI_MOD_SHIFT) == 1);   /* no pane is active */
+    cui_vec2 pt = center(rect_of(ui, cui_make_id(ui, "Pane")));
+    click_at(ui, build_nested_focus, &s, pt.x, pt.y);
+    CHECK(s.hit == 2);                                     /* inactive is not disabled */
+    s.nested = true;
+    run(ui, build_nested_focus, &s, 1);
+    CHECK(tab_and_activate(ui, &s, 0) == 1);               /* child cannot activate its inactive parent */
+    s.active = true;
+    run(ui, build_nested_focus, &s, 1);
+    CHECK(tab_and_activate(ui, &s, CUI_MOD_SHIFT) == 2);   /* same child id as the active top-level pane */
+    CHECK(tab_and_activate(ui, &s, 0) == 2);
+    for (s.depth = 16; s.depth <= 64; s.depth *= 4) {
+        run(ui, build_nested_focus, &s, 1);
+        CHECK(tab_and_activate(ui, &s, 0) == 5);           /* pop restores level 16 (or 64) */
+    }
+    cui_destroy(ui);
+}
+
+/** The wheel goes to a canvas's region and nowhere else; around it the page scrolls. */
+static void test_canvas_wheel(void) {
+    printf("canvas: wheel region in a scrolling page\n");
+    cui_ctx *ui = new_ctx();
+    wheel_canvas w = { .region = true };
+    run(ui, build_wheel_canvas, &w, 2);
+    const cui_rect before = rect_of(ui, w.canvas);
+    CHECK(before.h > 90);
+
+    cui_input_mouse_move(ui, before.x + before.w / 4, before.y + before.h / 2);
+    run(ui, build_wheel_canvas, &w, 1);
+    cui_input_scroll(ui, 0.5f, -1);
+    run(ui, build_wheel_canvas, &w, 20);
+    CHECK(w.takes == 1);
+    CHECK_NEAR(w.got.x, 0.5, 1e-6);
+    CHECK_NEAR(w.got.y, -1, 1e-6);
+    CHECK_NEAR(rect_of(ui, w.canvas).y, before.y, 0.01);   /* the page stayed */
+
+    cui_input_mouse_move(ui, before.x + before.w * 3 / 4, before.y + before.h / 2);
+    run(ui, build_wheel_canvas, &w, 1);
+    cui_input_scroll(ui, 0, -1);
+    run(ui, build_wheel_canvas, &w, 30);
+    CHECK(w.takes == 1);                                    /* outside the region */
+    CHECK(rect_of(ui, w.canvas).y < before.y - 1);         /* the page scrolled */
+    cui_destroy(ui);
+
+    ui = new_ctx();                                         /* no region: as before */
+    wheel_canvas plain = { .region = false };
+    run(ui, build_wheel_canvas, &plain, 2);
+    const cui_rect at = rect_of(ui, plain.canvas);
+    cui_input_mouse_move(ui, at.x + at.w / 4, at.y + at.h / 2);
+    run(ui, build_wheel_canvas, &plain, 1);
+    cui_input_scroll(ui, 0, -1);
+    run(ui, build_wheel_canvas, &plain, 30);
+    CHECK(plain.takes == 0);
+    CHECK(rect_of(ui, plain.canvas).y < at.y - 1);
+    cui_destroy(ui);
+
+    ui = new_ctx();                                         /* in a disabled scope: not taken */
+    wheel_canvas off = { .region = true, .disabled = true };
+    run(ui, build_wheel_canvas, &off, 2);
+    const cui_rect o = rect_of(ui, off.canvas);
+    cui_input_mouse_move(ui, o.x + o.w / 4, o.y + o.h / 2);
+    run(ui, build_wheel_canvas, &off, 1);
+    cui_input_scroll(ui, 0, -1);
+    run(ui, build_wheel_canvas, &off, 20);
+    CHECK(off.takes == 0);
+    CHECK(rect_of(ui, off.canvas).y < o.y - 1);             /* the page took it */
+    cui_destroy(ui);
+
+    ui = new_ctx();                                         /* turns disabled: not taken from then on */
+    wheel_canvas turn = { .region = true };
+    run(ui, build_wheel_canvas, &turn, 2);
+    const cui_rect t = rect_of(ui, turn.canvas);
+    cui_input_mouse_move(ui, t.x + t.w / 4, t.y + t.h / 2);
+    run(ui, build_wheel_canvas, &turn, 1);
+    cui_input_scroll(ui, 0, -1);
+    run(ui, build_wheel_canvas, &turn, 20);
+    CHECK(turn.takes == 1);
+    turn.disabled = true;                                   /* the wheel is still aimed by the enabled region */
+    cui_input_scroll(ui, 0, -1);
+    run(ui, build_wheel_canvas, &turn, 20);
+    CHECK(turn.takes == 1);
+    CHECK_NEAR(rect_of(ui, turn.canvas).y, t.y, 0.01);      /* dropped: the page did not move either */
+    cui_input_scroll(ui, 0, -1);
+    run(ui, build_wheel_canvas, &turn, 20);
+    CHECK(turn.takes == 1);
+    CHECK(rect_of(ui, turn.canvas).y < t.y - 1);            /* no region now: the page took it */
+    cui_destroy(ui);
+}
+
+/** A page whose canvas has zoom controls floating over it. */
+static void build_canvas_rail_page(cui_ctx *ui, void *user) {
+    cui_id *anchor = user;
+    static cui_node_view view;
+    cui_scroll(ui, .id = "page", .height = CUI_PX(180), .width = CUI_PX(320)) {
+        *anchor = cui_box_begin(ui, &(cui_box){ .id = "art", .width = CUI_PX(300), .height = CUI_PX(240) });
+        cui_box_end(ui);
+        cui_canvas_controls(ui, "zoom", &view);
+        cui_box(ui, .height = CUI_PX(400)) {}
+    }
+}
+
+/** The wheel over floating controls scrolls the page both ways: overlay nodes are not wheel targets. */
+static void test_canvas_rail_wheel(void) {
+    printf("canvas controls: the wheel over the rail scrolls the page\n");
+    cui_ctx *ui = new_ctx();
+    cui_id anchor = 0;
+    run(ui, build_canvas_rail_page, &anchor, 3);
+    cui_scroll_to(ui, "page", 40);
+    run(ui, build_canvas_rail_page, &anchor, 2);
+    cui_rect a = rect_of(ui, anchor);
+    cui_input_mouse_move(ui, a.x + a.w - 20, a.y + a.h / 2);
+    run(ui, build_canvas_rail_page, &anchor, 1);
+    cui_input_scroll(ui, 0, 1);
+    run(ui, build_canvas_rail_page, &anchor, 2);
+    CHECK(rect_of(ui, anchor).y > a.y + 1);
+    a = rect_of(ui, anchor);
+    cui_input_scroll(ui, 0, -1);
+    run(ui, build_canvas_rail_page, &anchor, 2);
+    CHECK(rect_of(ui, anchor).y < a.y - 1);
+    cui_destroy(ui);
+}
+
+/** A mixed wheel event scrolls the text vertically and the page horizontally. */
+static void test_nested_textarea_mixed_wheel(void) {
+    printf("text area: mixed-axis wheel and Shift routing\n");
+    cui_ctx *ui = new_ctx();
+    area_ctx a = { .buf = "One\nTwo\nThree\nFour\nFive\nSix\nSeven\nEight\nNine\nTen" };
+    run(ui, build_nested_textarea, &a, 2);
+    cui_scroll_to(ui, "page", 40);
+    run(ui, build_nested_textarea, &a, 2);
+    const cui_rect before = rect_of(ui, a.id);
+    cui_input_mouse_move(ui, before.x + before.w / 2, before.y + before.h / 2);
+
+    cui_input_scroll(ui, -1, -1);
+    run(ui, build_nested_textarea, &a, 1);
+    const cui_rect mixed = rect_of(ui, a.id);
+    CHECK(mixed.x < before.x);
+    CHECK_NEAR(mixed.y, before.y, 0.01);
+
+    /* Scrolling back up must move the text toward its top before moving the page. */
+    cui_input_scroll(ui, 0, 1);
+    run(ui, build_nested_textarea, &a, 1);
+    CHECK_NEAR(rect_of(ui, a.id).y, mixed.y, 0.01);
+
+    const cui_rect before_shift = rect_of(ui, a.id);
+    cui_input_key(ui, CUI_KEY_NONE, false, CUI_MOD_SHIFT);
+    cui_input_scroll(ui, 0, -1);
+    run(ui, build_nested_textarea, &a, 1);
+    CHECK(rect_of(ui, a.id).x < before_shift.x);
+    CHECK_NEAR(rect_of(ui, a.id).y, before_shift.y, 0.01);
+    cui_destroy(ui);
+}
+
+/* rows of different heights in a 200 point list; row 9 is taller than the list */
+typedef struct { cui_id row[12], stray; int reveal; bool before; } reveal_ctx;
+static float reveal_row_h(int i) { return i == 9 ? 260.0f : 30.0f + (float)(i % 3) * 12.0f; }
+static void build_reveal(cui_ctx *ui, void *u) {
+    reveal_ctx *c = u;
+    if (c->before && c->reveal >= 0) cui_scroll_reveal(ui, "list", c->row[c->reveal]);
+    cui_scroll(ui, .id = "list", .width = CUI_PX(300), .height = CUI_PX(200), .gap = 4) {
+        for (int i = 0; i < 12; i++) {
+            cui_push_id_int(ui, i);
+            c->row[i] = cui_box_begin(ui, &(cui_box){ .id = "row", .width = CUI_FILL, .height = CUI_PX(reveal_row_h(i)) });
+            cui_box_end(ui);
+            cui_pop_id(ui);
+            if (!c->before && i == c->reveal) cui_scroll_reveal(ui, "list", c->row[i]);
+        }
+    }
+    if (c->stray) cui_scroll_reveal(ui, "list", c->stray);   /* an id with no rectangle */
+}
+/* reveals row i (once), lets the list settle and returns how far it moved */
+static float reveal_step(cui_ctx *ui, reveal_ctx *c, int i, int frames) {
+    float y0 = rect_of(ui, c->row[0]).y;
+    c->reveal = i;
+    run(ui, build_reveal, c, 1);
+    c->reveal = -1;
+    run(ui, build_reveal, c, frames);
+    return y0 - rect_of(ui, c->row[0]).y;
+}
+
+/** cui_scroll_reveal moves a list the least that shows a row, and only when it must. */
+static void test_scroll_reveal(void) {
+    printf("scroll: reveal a row with the least movement\n");
+    cui_ctx *ui = new_ctx();
+    reveal_ctx c;
+    memset(&c, 0, sizeof c);
+    c.reveal = -1;
+    cui_id list = cui_make_id(ui, "list");
+    /* before the first layout no rectangle is known: nothing moves, nothing breaks */
+    c.reveal = 5;
+    run(ui, build_reveal, &c, 1);
+    c.reveal = -1;
+    run(ui, build_reveal, &c, 2);
+    cui_rect v = rect_of(ui, list);
+    CHECK_NEAR(rect_of(ui, c.row[0]).y, v.y, 0.01);
+
+    /* wholly visible: no movement */
+    CHECK(rect_of(ui, c.row[3]).y + rect_of(ui, c.row[3]).h <= v.y + v.h);
+    CHECK_NEAR(reveal_step(ui, &c, 3, 2), 0, 0.01);
+    CHECK_NEAR(reveal_step(ui, &c, 0, 2), 0, 0.01);
+
+    /* below: just enough to show its bottom edge */
+    cui_rect r = rect_of(ui, c.row[6]);
+    CHECK(r.y + r.h > v.y + v.h);
+    CHECK_NEAR(reveal_step(ui, &c, 6, 2), r.y + r.h - (v.y + v.h), 0.01);
+    r = rect_of(ui, c.row[6]);
+    CHECK_NEAR(r.y + r.h, v.y + v.h, 0.01);
+    CHECK_NEAR(reveal_step(ui, &c, 6, 2), 0, 0.01);   /* now in view: stays */
+    CHECK_NEAR(reveal_step(ui, &c, 5, 2), 0, 0.01);   /* above it, still in view */
+
+    /* above: to its top edge */
+    r = rect_of(ui, c.row[1]);
+    CHECK(r.y < v.y);
+    CHECK_NEAR(reveal_step(ui, &c, 1, 2), r.y - v.y, 0.01);
+    CHECK_NEAR(rect_of(ui, c.row[1]).y, v.y, 0.01);
+
+    /* taller than the list: its top at the top, from below and with its top in view */
+    CHECK(rect_of(ui, c.row[9]).y > v.y + v.h);
+    reveal_step(ui, &c, 9, 2);
+    CHECK_NEAR(rect_of(ui, c.row[9]).y, v.y, 0.01);
+    CHECK_NEAR(reveal_step(ui, &c, 9, 2), 0, 0.01);
+    cui_scroll_to(ui, "list", 0);
+    run(ui, build_reveal, &c, 2);
+    cui_scroll_to(ui, "list", rect_of(ui, c.row[9]).y - v.y - 100);
+    run(ui, build_reveal, &c, 2);   /* row 9's top halfway down, its bottom far below */
+    r = rect_of(ui, c.row[9]);
+    CHECK(r.y > v.y && r.y < v.y + v.h);
+    CHECK_NEAR(reveal_step(ui, &c, 9, 2), r.y - v.y, 0.01);
+    CHECK_NEAR(rect_of(ui, c.row[9]).y, v.y, 0.01);
+
+    /* called before the area is built, as when keys are handled first: the same */
+    c.before = true;
+    r = rect_of(ui, c.row[2]);
+    CHECK_NEAR(reveal_step(ui, &c, 2, 2), r.y - v.y, 0.01);
+    c.before = false;
+
+    /* an id that was never laid out: nothing moves */
+    c.stray = cui_make_id(ui, "nowhere");
+    float y0 = rect_of(ui, c.row[0]).y;
+    run(ui, build_reveal, &c, 3);
+    CHECK_NEAR(rect_of(ui, c.row[0]).y, y0, 0.01);
+    c.stray = 0;
+    cui_destroy(ui);
+
+    /* with motion on, a second reveal while the list is still moving does not overshoot */
+    ui = new_ctx();
+    cui_set_reduced_motion(ui, false);
+    memset(&c, 0, sizeof c);
+    c.reveal = -1;
+    run(ui, build_reveal, &c, 3);
+    c.reveal = 6;
+    run(ui, build_reveal, &c, 1);
+    c.reveal = -1;
+    run(ui, build_reveal, &c, 2);    /* partway there */
+    reveal_step(ui, &c, 7, 120);
+    r = rect_of(ui, c.row[7]);
+    CHECK_NEAR(r.y + r.h, v.y + v.h, 0.6);   /* settled offsets round to whole pixels */
+    cui_destroy(ui);
+}
+
+/** Give the number field room for the draft and both step buttons. */
+static void build_number_edit(cui_ctx *ui, void *user) {
+    cui_number(ui, "quantity", user, 0, 99, .width = CUI_PX(240));
+}
+
+/** Commit a canonical draft and keep the previous value on invalid input. */
+static void test_number_edit_commit(void) {
+    printf("number field: clamp committed text and reject nonfinite input\n");
+    cui_ctx *ui = new_ctx();
+    double value = 3;
+    run(ui, build_number_edit, &value, 2);
+    key(ui, build_number_edit, &value, CUI_KEY_TAB, 0);
+    key(ui, build_number_edit, &value, CUI_KEY_A, CUI_MOD_PRIMARY);
+    type(ui, build_number_edit, &value, "999");
+    key(ui, build_number_edit, &value, CUI_KEY_ENTER, 0);
+    CHECK(value == 99);
+    key(ui, build_number_edit, &value, CUI_KEY_A, CUI_MOD_PRIMARY);
+    g_clip[0] = 0;
+    key(ui, build_number_edit, &value, CUI_KEY_C, CUI_MOD_PRIMARY);
+    if (strcmp(g_clip, "99") != 0) printf("  Committed draft: %s\n", g_clip);
+    CHECK(strcmp(g_clip, "99") == 0);
+
+    type(ui, build_number_edit, &value, "nan");
+    if (!isfinite(value)) printf("  Number field returned a nonfinite value\n");
+    CHECK(isfinite(value) && value == 99);
+    key(ui, build_number_edit, &value, CUI_KEY_ENTER, 0);
+    key(ui, build_number_edit, &value, CUI_KEY_A, CUI_MOD_PRIMARY);
+    g_clip[0] = 0;
+    key(ui, build_number_edit, &value, CUI_KEY_C, CUI_MOD_PRIMARY);
+    CHECK(strcmp(g_clip, "99") == 0);
+
+    type(ui, build_number_edit, &value, "7x");
+    CHECK(value == 99);
+    key(ui, build_number_edit, &value, CUI_KEY_TAB, 0);
+    key(ui, build_number_edit, &value, CUI_KEY_TAB, CUI_MOD_SHIFT);
+    key(ui, build_number_edit, &value, CUI_KEY_A, CUI_MOD_PRIMARY);
+    g_clip[0] = 0;
+    key(ui, build_number_edit, &value, CUI_KEY_C, CUI_MOD_PRIMARY);
+    CHECK(strcmp(g_clip, "99") == 0);
+    cui_destroy(ui);
+}
+
+/** Let the searchable popup own the only text editor in the frame. */
+typedef struct { int choice; bool searchable; } select_keys_ctx;
+static void build_searchable_select(cui_ctx *ui, void *user) {
+    select_keys_ctx *c = user;
+    const char *items[] = { "Alpha", "Beta" };
+    cui_select(ui, "choice", items, 2, &c->choice, .searchable = c->searchable);
+}
+
+/** Escape closes the search and leaves its trigger available to Enter, also
+ * while the list animates closed; Enter opens a plain select without picking. */
+static void test_searchable_select_reopen(void) {
+    printf("searchable select: keyboard reopening after Escape\n");
+    for (int animated = 0; animated < 2; animated++) {
+        cui_ctx *ui = new_ctx();
+        cui_set_reduced_motion(ui, !animated);
+        select_keys_ctx c = { .searchable = true };
+        run(ui, build_searchable_select, &c, 2);
+        key(ui, build_searchable_select, &c, CUI_KEY_TAB, 0);
+        key(ui, build_searchable_select, &c, CUI_KEY_DOWN, 0);
+        run(ui, build_searchable_select, &c, 20);
+        CHECK(cui_wants_keyboard(ui));
+        key(ui, build_searchable_select, &c, CUI_KEY_ESCAPE, 0);
+        run(ui, build_searchable_select, &c, 20);
+        CHECK(!cui_wants_keyboard(ui));
+        key(ui, build_searchable_select, &c, CUI_KEY_ENTER, 0);
+        run(ui, build_searchable_select, &c, 20);
+        CHECK(cui_wants_keyboard(ui));
+        CHECK(c.choice == 0);
+        /* picking an item also gives the keyboard back to the trigger */
+        key(ui, build_searchable_select, &c, CUI_KEY_DOWN, 0);
+        key(ui, build_searchable_select, &c, CUI_KEY_ENTER, 0);
+        run(ui, build_searchable_select, &c, 20);
+        CHECK(c.choice == 1 && !cui_wants_keyboard(ui));
+        key(ui, build_searchable_select, &c, CUI_KEY_ENTER, 0);
+        run(ui, build_searchable_select, &c, 20);
+        CHECK(cui_wants_keyboard(ui) && c.choice == 1);
+        cui_destroy(ui);
+    }
+    cui_ctx *ui = new_ctx();
+    select_keys_ctx c = { .searchable = false };
+    run(ui, build_searchable_select, &c, 2);
+    key(ui, build_searchable_select, &c, CUI_KEY_TAB, 0);
+    key(ui, build_searchable_select, &c, CUI_KEY_ENTER, 0);
+    run(ui, build_searchable_select, &c, 2);
+    key(ui, build_searchable_select, &c, CUI_KEY_DOWN, 0);
+    key(ui, build_searchable_select, &c, CUI_KEY_ENTER, 0);
+    CHECK(c.choice == 1);
+    cui_destroy(ui);
+}
+
 /* more actions ------------------------------------------------------------ */
 
 typedef struct {
@@ -611,6 +1647,40 @@ static void build_actions(cui_ctx *ui, void *u) {
             a->dial_id = cui_last_id(ui);
         }
     }
+}
+
+static void build_toggle_group_arrows(cui_ctx *ui, void *user) {
+    const char *labels[] = { "First", "Second", "Third", "Fourth" };
+    cui_toggle_group(ui, "formats", labels, 4, user);
+}
+
+/** Move one slot per arrow and preserve focus given by a later mouse press. */
+static void test_toggle_group_arrows(void) {
+    printf("toggle group: one step per arrow press\n");
+    cui_ctx *ui = new_ctx();
+    bool values[4] = { false };
+    run(ui, build_toggle_group_arrows, values, 1);
+    key(ui, build_toggle_group_arrows, values, CUI_KEY_TAB, 0);
+    key(ui, build_toggle_group_arrows, values, CUI_KEY_RIGHT, 0);
+    key(ui, build_toggle_group_arrows, values, CUI_KEY_ENTER, 0);
+    CHECK(!values[0] && values[1] && !values[2] && !values[3]);
+    key(ui, build_toggle_group_arrows, values, CUI_KEY_LEFT, 0);
+    key(ui, build_toggle_group_arrows, values, CUI_KEY_SPACE, 0);
+    CHECK(values[0] && values[1] && !values[2] && !values[3]);
+
+    memset(values, 0, sizeof values);
+    cui_rect group = cui_last_rect(ui);
+    cui_input_mouse_move(ui, group.x + group.w - 12, group.y + group.h / 2);
+    cui_input_key(ui, CUI_KEY_RIGHT, true, 0);
+    cui_input_key(ui, CUI_KEY_RIGHT, false, 0);
+    cui_input_mouse_button(ui, CUI_MOUSE_LEFT, true);
+    run(ui, build_toggle_group_arrows, values, 1);
+    cui_input_mouse_button(ui, CUI_MOUSE_LEFT, false);
+    run(ui, build_toggle_group_arrows, values, 1);
+    CHECK(values[3]);
+    key(ui, build_toggle_group_arrows, values, CUI_KEY_ENTER, 0);
+    CHECK(!values[0] && !values[1] && !values[2] && !values[3]);
+    cui_destroy(ui);
 }
 
 static void test_more_actions(void) {
@@ -703,6 +1773,45 @@ static void test_more_actions(void) {
     cui_destroy(ui);
 }
 
+typedef struct { int chosen; bool caller_scope_intact; } dial_scope_case;
+
+/** Use a false scope around the dial, leaving enough room to probe the stack. */
+static void build_dial_scope(cui_ctx *ui, void *user) {
+    dial_scope_case *c = user;
+    static const cui_speed_action action = { CUI_ICON_PLUS, "Add" };
+    cui_column(ui, .pad = 25) {
+        cui_push_disabled(ui, false);
+        c->chosen = cui_speed_dial(ui, "scope dial", &action, 1, .placement = CUI_PLACE_BOTTOM_START);
+        /* A full false stack cannot record the extra false push. The first
+           pop must remove the true entry if the dial kept our first one. */
+        if (c->chosen == 0) {
+            cui_push_disabled(ui, true);
+            for (int i = 0; i < 31; i++) cui_push_disabled(ui, false);
+            for (int i = 0; i < 30; i++) cui_pop_disabled(ui);
+            cui_pop_disabled(ui);
+            c->caller_scope_intact = !cui_is_disabled(ui);
+        }
+        cui_pop_disabled(ui);
+    }
+}
+
+/** The scope depth is unchanged when keyboard activation closes the dial. */
+static void test_dial_scope(void) {
+    printf("speed dial: action preserves the caller scope\n");
+    cui_ctx *ui = new_ctx();
+    cui_set_reduced_motion(ui, false);
+    dial_scope_case c = {0};
+    run(ui, build_dial_scope, &c, 3);
+    key(ui, build_dial_scope, &c, CUI_KEY_TAB, 0);
+    key(ui, build_dial_scope, &c, CUI_KEY_ENTER, 0);
+    run(ui, build_dial_scope, &c, 40);
+    key(ui, build_dial_scope, &c, CUI_KEY_TAB, 0);
+    key(ui, build_dial_scope, &c, CUI_KEY_ENTER, 0);
+    CHECK(c.chosen == 0);
+    CHECK(c.caller_scope_intact);
+    cui_destroy(ui);
+}
+
 typedef struct { char title[64]; float v; double money; cui_key_combo combo; int edit_flags; cui_id title_id, scrub_id, money_id, rec_id, other_id; char other[16]; } inp_ctx;
 static void build_more_inputs(cui_ctx *ui, void *u) {
     inp_ctx *a = u;
@@ -718,6 +1827,268 @@ static void build_more_inputs(cui_ctx *ui, void *u) {
         cui_input(ui, "other", a->other, sizeof a->other, .width = CUI_PX(200));
         a->other_id = cui_last_id(ui);
     }
+}
+
+typedef struct { float lo, hi, other; } range_keyboard_ctx;
+
+static void build_range_keyboard(cui_ctx *ui, void *user) {
+    range_keyboard_ctx *r = user;
+    cui_range_slider(ui, "Range", &r->lo, &r->hi, 0, 100);
+    cui_slider(ui, "Other", &r->other, 0, 100);
+}
+
+/** Exercise both thumbs and show which one is selected when they overlap. */
+static void test_range_slider_keyboard(void) {
+    printf("range slider: keyboard adjustment of both thumbs\n");
+    cui_ctx *ui = new_ctx();
+    enum { width = 320, height = 150, stride = width * 4 };
+    unsigned char lower[height * stride], upper[height * stride];
+    cui_set_viewport(ui, width, height, 1);
+    cui_input_mouse_leave(ui);
+    range_keyboard_ctx r = { 20, 75, 40 };
+    run(ui, build_range_keyboard, &r, 1);
+    int unfocused_vertices = cui_get_draw_data(ui)->vertex_count;
+    key(ui, build_range_keyboard, &r, CUI_KEY_TAB, 0);
+    CHECK(cui_get_draw_data(ui)->vertex_count > unfocused_vertices);
+    key(ui, build_range_keyboard, &r, CUI_KEY_RIGHT, 0);
+    CHECK_NEAR(r.lo, 21, 0.01);
+    CHECK_NEAR(r.hi, 75, 0.01);
+    key(ui, build_range_keyboard, &r, CUI_KEY_END, 0);
+    CHECK_NEAR(r.lo, 75, 0.01);
+    cui_sw_render(g_sw, cui_get_draw_data(ui), lower, width, height, stride, CUI_SW_RGBA);
+    key(ui, build_range_keyboard, &r, CUI_KEY_SPACE, 0);
+    cui_sw_render(g_sw, cui_get_draw_data(ui), upper, width, height, stride, CUI_SW_RGBA);
+    CHECK(memcmp(lower, upper, sizeof lower) != 0);
+    key(ui, build_range_keyboard, &r, CUI_KEY_RIGHT, CUI_MOD_SHIFT);
+    CHECK_NEAR(r.lo, 75, 0.01);
+    CHECK_NEAR(r.hi, 85, 0.01);
+    key(ui, build_range_keyboard, &r, CUI_KEY_TAB, 0);
+    key(ui, build_range_keyboard, &r, CUI_KEY_RIGHT, 0);
+    CHECK_NEAR(r.other, 41, 0.01);
+    CHECK_NEAR(r.hi, 85, 0.01);
+    cui_destroy(ui);
+}
+
+typedef struct { int ancestor, page; } navigation_focus_ctx;
+
+/** Leave space around both rows for the focus rings. */
+static void build_navigation_focus(cui_ctx *ui, void *user) {
+    navigation_focus_ctx *n = user;
+    const char *path[] = { "Home", "Projects", "Settings" };
+    cui_column(ui, .pad = 12, .gap = 12) {
+        n->ancestor = cui_breadcrumb(ui, path, 3);
+        cui_pagination(ui, "pages", &n->page, 3);
+    }
+}
+
+/** Compare only the pixels above the middle of the expected focus target. */
+static bool focus_strip_changed(const unsigned char *a, const unsigned char *b, int stride, int height, cui_vec2 top) {
+    int x = (int)top.x - 4;
+    int y0 = (int)top.y - 4;
+    if (x < 0 || x + 8 > stride / 4 || y0 < 0 || y0 + 7 > height) return false;
+    for (int y = y0; y < y0 + 7; y++) {
+        if (memcmp(a + y * stride + x * 4, b + y * stride + x * 4, 8 * 4) != 0) return true;
+    }
+    return false;
+}
+
+/** The ring appears over each keyboard target and clears when focus moves. */
+static void test_navigation_focus_visible(void) {
+    printf("breadcrumb and pagination: visible keyboard focus\n");
+    enum { width = 400, height = 120, stride = width * 4 };
+    unsigned char initial[height * stride], focused[height * stride];
+    navigation_focus_ctx n = { -1, 0 };
+    cui_ctx *ui = new_ctx();
+    cui_set_viewport(ui, width, height, 1);
+    cui_input_mouse_leave(ui);
+    run(ui, build_navigation_focus, &n, 1);
+    cui_rect home = cui_get_rect(ui, cui_make_id(ui, "Home"));
+    cui_rect next = cui_last_rect(ui);
+    cui_vec2 home_top = { home.x + home.w / 2, home.y };
+    /* Page two sits in the middle of the three numbered buttons and two arrows. */
+    cui_vec2 page_top = { (home.x + next.x + next.w) / 2, next.y };
+    cui_sw_render(g_sw, cui_get_draw_data(ui), initial, width, height, stride, CUI_SW_RGBA);
+    key(ui, build_navigation_focus, &n, CUI_KEY_TAB, 0);
+    cui_sw_render(g_sw, cui_get_draw_data(ui), focused, width, height, stride, CUI_SW_RGBA);
+    CHECK(focus_strip_changed(initial, focused, stride, height, home_top));
+    CHECK(!focus_strip_changed(initial, focused, stride, height, page_top));
+    key(ui, build_navigation_focus, &n, CUI_KEY_ENTER, 0);
+    CHECK(n.ancestor == 0);
+    for (int i = 0; i < 3; i++) key(ui, build_navigation_focus, &n, CUI_KEY_TAB, 0);
+    cui_sw_render(g_sw, cui_get_draw_data(ui), focused, width, height, stride, CUI_SW_RGBA);
+    CHECK(!focus_strip_changed(initial, focused, stride, height, home_top));
+    CHECK(focus_strip_changed(initial, focused, stride, height, page_top));
+    key(ui, build_navigation_focus, &n, CUI_KEY_ENTER, 0);
+    CHECK(n.page == 1);
+    cui_destroy(ui);
+}
+
+typedef struct { int page; cui_size width; float sibling_width; } unnamed_pager_ctx;
+
+/** Put the pager in a padded box with an optional sibling competing for space. */
+static void build_unnamed_pager(cui_ctx *ui, void *user) {
+    unnamed_pager_ctx *p = user;
+    cui_row(ui, .width = CUI_FILL) {
+        if (p->sibling_width > 0) {
+            cui_box(ui, .width = CUI_PX(p->sibling_width)) cui_text(ui, "Sibling");
+        }
+        cui_box(ui, .width = p->width, .pad = 24) {
+            cui_pagination(ui, "pages", &p->page, 12);
+        }
+    }
+}
+
+/** A fixed box constrains the pager and a content-sized box can grow again. */
+static void test_pagination_unnamed_width(void) {
+    printf("pagination: stays inside an unnamed padded parent\n");
+    cui_ctx *ui = new_ctx();
+    cui_set_viewport(ui, 360, 160, 1);
+    unnamed_pager_ctx p = { 5, CUI_PX(328), 0 };
+    run(ui, build_unnamed_pager, &p, 3);
+    cui_rect next = cui_last_rect(ui);
+    CHECK(next.w > 0 && next.x + next.w <= 304.5f);
+    cui_destroy(ui);
+
+    ui = new_ctx();
+    p.width = CUI_FIT;
+    cui_set_viewport(ui, 300, 160, 1);
+    run(ui, build_unnamed_pager, &p, 3);
+    next = cui_last_rect(ui);
+    float compact_edge = next.x + next.w;
+    CHECK(compact_edge <= 276.5f);
+    cui_set_viewport(ui, 650, 160, 1);
+    run(ui, build_unnamed_pager, &p, 3);
+    next = cui_last_rect(ui);
+    CHECK(next.x + next.w > 304.5f);
+    p.sibling_width = 350;
+    run(ui, build_unnamed_pager, &p, 3);
+    next = cui_last_rect(ui);
+    CHECK_NEAR(next.x + next.w, p.sibling_width + compact_edge, 0.5);
+    p.sibling_width = 0;
+    cui_set_viewport(ui, 300, 160, 1);
+    run(ui, build_unnamed_pager, &p, 3);
+    next = cui_last_rect(ui);
+    CHECK_NEAR(next.x + next.w, compact_edge, 0.5);
+    cui_destroy(ui);
+}
+
+/** Render the narrow stepper with and without an unrelated, wider sibling. */
+static void render_stepper_pair(bool sibling, unsigned char *pixels) {
+    enum { width = 950, height = 80 };
+    const char *steps[] = { "Account", "Workspace", "Invite team", "Done" };
+    cui_ctx *ui = new_ctx();
+    cui_set_viewport(ui, width, height, 1);
+    for (int frame = 0; frame < 3; frame++) {
+        cui_begin_frame(ui, 1.0f / 60.0f);
+        cui_row(ui, .gap = 16, .pad = 8) {
+            cui_box(ui, .width = CUI_PX(280)) cui_stepper(ui, steps, 4, 1);
+            if (sibling) {
+                cui_box(ui, .width = CUI_PX(620)) cui_stepper(ui, steps, 4, 1);
+            }
+        }
+        cui_end_frame(ui);
+    }
+    cui_sw_render(g_sw, cui_get_draw_data(ui), pixels, width, height, width * 4, CUI_SW_RGBA);
+    cui_destroy(ui);
+}
+
+/** The wide stepper must not change the narrow one's rendered captions. */
+static void test_stepper_width_isolation(void) {
+    printf("stepper: duplicate captions do not share measured width\n");
+    enum { height = 80, stride = 950 * 4, left_column = 288 * 4 };
+    unsigned char alone[height * stride], pair[height * stride];
+    render_stepper_pair(false, alone);
+    render_stepper_pair(true, pair);
+    bool same = true;
+    for (int y = 0; y < height; y++) {
+        if (memcmp(alone + y * stride, pair + y * stride, left_column) != 0) same = false;
+    }
+    CHECK(same);
+}
+
+typedef struct { float lo, hi; bool chosen; } range_menu_ctx;
+
+/** Attach the menu to the track so the range can retain focus underneath it. */
+static void build_range_menu(cui_ctx *ui, void *user) {
+    range_menu_ctx *r = user;
+    cui_range_slider(ui, "Range", &r->lo, &r->hi, 0, 100);
+    cui_context_menu(ui, "range-menu") {
+        if (cui_menu_item(ui, "First")) r->chosen = true;
+        cui_menu_item(ui, "Second");
+    }
+}
+
+/** A context menu uses the arrow keys even when its anchor keeps focus. */
+static void test_range_slider_context_menu(void) {
+    printf("range slider: a context menu owns its arrow keys\n");
+    cui_ctx *ui = new_ctx();
+    range_menu_ctx r = { 20, 75, false };
+    run(ui, build_range_menu, &r, 1);
+    key(ui, build_range_menu, &r, CUI_KEY_TAB, 0);
+    cui_vec2 track = center(cui_last_rect(ui));
+    cui_input_mouse_move(ui, track.x, track.y);
+    cui_input_mouse_button(ui, CUI_MOUSE_RIGHT, true);
+    run(ui, build_range_menu, &r, 1);
+    cui_input_mouse_button(ui, CUI_MOUSE_RIGHT, false);
+    cui_input_mouse_leave(ui);
+    run(ui, build_range_menu, &r, 1);
+    key(ui, build_range_menu, &r, CUI_KEY_DOWN, 0);
+    key(ui, build_range_menu, &r, CUI_KEY_ENTER, 0);
+    CHECK(r.chosen);
+    CHECK_NEAR(r.lo, 20, 0.01);
+    CHECK_NEAR(r.hi, 75, 0.01);
+    cui_destroy(ui);
+}
+
+/** Draw the scrub alone to drive its native edit-and-commit path. */
+static void build_scrub_commit(cui_ctx *ui, void *user) {
+    cui_scrub(ui, "Level", user, 0, 100);
+}
+
+/** Reject nonfinite and partial numbers while still accepting a complete draft. */
+static void test_scrub_commit(void) {
+    printf("scrub: finite, complete numeric drafts\n");
+    static const char *const drafts[] = { "nan", "33junk", "1e1000", "42" };
+    cui_ctx *ui = new_ctx();
+    float value = 20;
+    run(ui, build_scrub_commit, &value, 3);
+    key(ui, build_scrub_commit, &value, CUI_KEY_TAB, 0);
+    for (int i = 0; i < 4; i++) {
+        key(ui, build_scrub_commit, &value, CUI_KEY_ENTER, 0);
+        run(ui, build_scrub_commit, &value, 1);
+        key(ui, build_scrub_commit, &value, CUI_KEY_A, CUI_MOD_PRIMARY);
+        type(ui, build_scrub_commit, &value, drafts[i]);
+        key(ui, build_scrub_commit, &value, CUI_KEY_ENTER, 0);
+        CHECK(value == (i == 3 ? 42 : 20));
+        run(ui, build_scrub_commit, &value, 1);
+    }
+    cui_destroy(ui);
+}
+
+/** Draw a money input with its default two decimal places. */
+static void build_money_capacity(cui_ctx *ui, void *user) {
+    cui_money_input(ui, "amount", user);
+}
+
+/** Reject a draft that cannot fit once digits are grouped for display. */
+static void test_money_capacity(void) {
+    printf("money input: reject drafts beyond the grouped display capacity\n");
+    cui_ctx *ui = new_ctx();
+    double value = 25.0;
+    run(ui, build_money_capacity, &value, 3);
+    key(ui, build_money_capacity, &value, CUI_KEY_TAB, 0);
+    key(ui, build_money_capacity, &value, CUI_KEY_A, CUI_MOD_PRIMARY);
+    char huge[64];
+    memset(huge, '9', sizeof huge - 1);
+    huge[sizeof huge - 1] = 0;
+    type(ui, build_money_capacity, &value, huge);
+    CHECK(value == 25.0);
+    key(ui, build_money_capacity, &value, CUI_KEY_A, CUI_MOD_PRIMARY);
+    type(ui, build_money_capacity, &value, "35.50");
+    CHECK(value == 35.5);
+    key(ui, build_money_capacity, &value, CUI_KEY_TAB, 0);
+    CHECK(value == 35.5);
+    cui_destroy(ui);
 }
 
 static void test_more_inputs(void) {
@@ -832,7 +2203,71 @@ static void test_swipe(void) {
     cui_destroy(ui);
 }
 
+/** Put the existing swipe row in a vertically scrolling area. */
+static void build_scroll_swipe(cui_ctx *ui, void *user) {
+    cui_scroll(ui, .id = "swipe page", .height = CUI_PX(200)) {
+        build_swipe(ui, user);
+        cui_gap(ui, 500);
+    }
+}
+
+/** Horizontal wheel motion reaches the row while the enclosing page stays put. */
+static void test_scroll_swipe(void) {
+    printf("swipe actions: horizontal wheel within a vertical scroll view\n");
+    cui_ctx *ui = new_ctx();
+    swipe_ctx a = { -1, 0 };
+    run(ui, build_scroll_swipe, &a, 3);
+    cui_rect row = rect_of(ui, a.row);
+    cui_input_mouse_move(ui, row.x + 250, row.y + row.h / 2);
+    run(ui, build_scroll_swipe, &a, 1);
+    cui_input_scroll(ui, -4, 0);
+    run(ui, build_scroll_swipe, &a, 16);
+    CHECK_NEAR(rect_of(ui, a.row).y, row.y, 0.01);
+    click_at(ui, build_scroll_swipe, &a, row.x + row.w - 30, row.y + row.h / 2);
+    CHECK(a.result == 101);
+    cui_destroy(ui);
+}
+
 /* pickers ------------------------------------------------------------------ */
+
+typedef struct { int day; float value; cui_id wheel, tape; } scroll_picker_case;
+
+/** Put the wheel and ruler inside a scrollable page with room to move. */
+static void build_scroll_pickers(cui_ctx *ui, void *user) {
+    scroll_picker_case *pickers = user;
+    static const char *const days[] = { "Monday", "Tuesday", "Wednesday" };
+    cui_scroll(ui, .id = "pickers", .height = CUI_PX(330)) {
+        cui_wheel_picker(ui, "day", days, 3, &pickers->day);
+        pickers->wheel = cui_last_id(ui);
+        cui_ruler_slider(ui, "Level", &pickers->value, 0, 100, .width = CUI_PX(180));
+        pickers->tape = cui_last_id(ui);
+        cui_gap(ui, 600);
+    }
+}
+
+/** Wheel input over each picker changes its value without scrolling its parent. */
+static void test_scroll_pickers(void) {
+    printf("pickers: wheel routing within a scroll view\n");
+    cui_ctx *ui = new_ctx();
+    scroll_picker_case pickers = { .day = 1, .value = 20 };
+    run(ui, build_scroll_pickers, &pickers, 3);
+    cui_rect wheel = rect_of(ui, pickers.wheel);
+    cui_vec2 p = center(wheel);
+    cui_input_mouse_move(ui, p.x, p.y);
+    run(ui, build_scroll_pickers, &pickers, 1);
+    cui_input_scroll(ui, 0, -1);
+    run(ui, build_scroll_pickers, &pickers, 2);
+    CHECK(pickers.day == 2);
+    CHECK_NEAR(rect_of(ui, pickers.wheel).y, wheel.y, 0.01);
+    p = center(rect_of(ui, pickers.tape));
+    cui_input_mouse_move(ui, p.x, p.y);
+    run(ui, build_scroll_pickers, &pickers, 1);
+    cui_input_scroll(ui, 0, -1);
+    run(ui, build_scroll_pickers, &pickers, 2);
+    CHECK_NEAR(pickers.value, 21, 0.01);
+    CHECK_NEAR(rect_of(ui, pickers.wheel).y, wheel.y, 0.01);
+    cui_destroy(ui);
+}
 
 static void test_date_math(void) {
     printf("dates: day numbers round trip\n");
@@ -879,6 +2314,215 @@ static void build_pickers(cui_ctx *ui, void *u) {
 }
 static void build_pickers_root(cui_ctx *ui, void *u) {
     cui_row(ui, .width = CUI_FILL, .height = CUI_FILL, .align = CUI_ALIGN_START) { build_pickers(ui, u); }
+}
+
+typedef struct { bool disabled; int drops; cui_id id; } drop_target_case;
+
+/** Use the same drop target with and without a disabled scope. */
+static void build_drop_target(cui_ctx *ui, void *user) {
+    drop_target_case *target = user;
+    cui_push_disabled(ui, target->disabled);
+    target->drops = cui_dropzone(ui, "drop target", .accept = "png", .width = CUI_PX(300));
+    target->id = cui_last_id(ui);
+    cui_pop_disabled(ui);
+}
+
+/** A disabled drop target leaves the drop available to the application. */
+static void test_disabled_file_drop(void) {
+    printf("file drop: a disabled target does not claim the drop\n");
+    cui_ctx *ui = new_ctx();
+    drop_target_case target = { .disabled = true };
+    const char *paths[] = { "photo.png" };
+    run(ui, build_drop_target, &target, 3);
+    cui_vec2 p = center(rect_of(ui, target.id));
+    cui_input_file_drop(ui, paths, 1, p.x, p.y);
+    cui_begin_frame(ui, 1.0f / 60.0f);
+    build_drop_target(ui, &target);
+    CHECK(target.drops == 0);
+    CHECK(cui_dropped_file_count(ui) == 1);
+    cui_end_frame(ui);
+    target.disabled = false;
+    cui_input_file_drop(ui, paths, 1, p.x, p.y);
+    run(ui, build_drop_target, &target, 1);
+    CHECK(target.drops == 1);
+    cui_destroy(ui);
+}
+
+#ifdef CUI_TEST_WINDOWS_IMAGE_PATH
+/** Load a generated PNG through the same UTF-8 path API used by avatar upload. */
+static void test_windows_image_path(void) {
+    printf("image load: UTF-8 path on Windows\n");
+    const wchar_t wide_name[] = L"cui-path-\x753b\x50cf.png";
+    const char utf8_name[] = "cui-path-\xe7\x94\xbb\xe5\x83\x8f.png";
+    const unsigned char pixel[4] = { 20, 40, 60, 255 };
+    const char fixture[] = "cui-image-path-fixture.png";
+    CHECK(cui_write_png(fixture, pixel, 1, 1, 4));
+    FILE *input = fopen(fixture, "rb");
+    FILE *output = _wfopen(wide_name, L"wb");
+    CHECK(input && output);
+    if (input && output) {
+        unsigned char data[256];
+        size_t count = fread(data, 1, sizeof data, input);
+        CHECK(feof(input) && fwrite(data, 1, count, output) == count);
+    }
+    if (input) fclose(input);
+    if (output) fclose(output);
+    remove(fixture);
+    cui_ctx *ui = new_ctx();
+    int w = 0, h = 0;
+    cui_texture image = cui_image_load(ui, utf8_name, &w, &h);
+    CHECK(image && w == 1 && h == 1);
+    if (image) cui_image_destroy(ui, image);
+    cui_destroy(ui);
+    _wremove(wide_name);
+}
+#endif
+
+typedef struct { const float *bins; int n; float lo, hi; } hist_bins_ctx;
+static void build_hist_bins(cui_ctx *ui, void *u) {
+    hist_bins_ctx *h = u;
+    cui_column(ui, .pad = 20, .width = CUI_PX(400)) { cui_histogram_slider(ui, "Price", h->bins, h->n, &h->lo, &h->hi, 0, 100); }
+}
+
+/* a negative bin count used to reach memcpy as a huge size, and NULL bins were read */
+static void test_histogram_slider_bins(void) {
+    printf("histogram slider: a negative count or no bins draws no bars\n");
+    cui_ctx *ui = new_ctx();
+    float *bins = malloc(sizeof(float) * 3);
+    bins[0] = 1; bins[1] = 4; bins[2] = 2;
+    hist_bins_ctx h = { NULL, -1, 20, 80 };
+    run(ui, build_hist_bins, &h, 2);
+    h.n = 4;                                   /* a count without data */
+    run(ui, build_hist_bins, &h, 2);
+    h.n = 0;
+    run(ui, build_hist_bins, &h, 2);
+    h.bins = bins; h.n = -5;
+    run(ui, build_hist_bins, &h, 2);
+    h.n = 3;
+    run(ui, build_hist_bins, &h, 2);
+    CHECK(h.lo == 20 && h.hi == 80);
+    cui_rect r = cui_get_rect(ui, cui_make_id(ui, "Price") ^ 0x4157u);
+    CHECK(r.w > 300 && r.h > 56);
+    free(bins);
+    cui_destroy(ui);
+}
+
+/** Keep the tape centered in the viewport to send it one wheel step. */
+static void build_bounded_ruler(cui_ctx *ui, void *user) {
+    cui_ruler_slider(ui, "Ruler", user, 0, 1.6f, .step = 1, .width = CUI_PX(230));
+}
+
+/** The wheel can reach a maximum that falls between ruler ticks. */
+static void test_ruler_bound(void) {
+    printf("ruler: wheel snapping stays within bounds\n");
+    cui_ctx *ui = new_ctx();
+    float value = 1;
+    run(ui, build_bounded_ruler, &value, 3);
+    cui_vec2 p = center(cui_last_rect(ui));
+    cui_input_mouse_move(ui, p.x, p.y);
+    run(ui, build_bounded_ruler, &value, 1);
+    cui_input_scroll(ui, 0, -1);
+    run(ui, build_bounded_ruler, &value, 1);
+    CHECK_NEAR(value, 1.6, 1e-6);
+    cui_destroy(ui);
+}
+
+typedef struct { bool color; cui_date date; cui_color rgb; cui_id id; } picker_focus_case;
+
+/** Build just one picker so the first Tab selects its trigger. */
+static void build_picker_focus(cui_ctx *ui, void *user) {
+    picker_focus_case *p = user;
+    cui_column(ui, .pad = 12, .width = CUI_PX(260)) {
+        if (p->color) cui_color_picker(ui, "picker", &p->rgb);
+        else cui_date_picker(ui, "picker", &p->date);
+        p->id = cui_make_id(ui, "picker");
+    }
+}
+
+/** Both trigger types show keyboard focus without opening their popup. */
+static void test_picker_focus_ring(void) {
+    printf("date and color picker: visible keyboard focus\n");
+    enum { width = 300, height = 124, stride = width * 4 };
+    unsigned char initial[height * stride], focused[height * stride];
+    for (int color = 0; color < 2; color++) {
+        cui_ctx *ui = new_ctx();
+        cui_set_viewport(ui, width, height, 1);
+        cui_input_mouse_leave(ui);
+        picker_focus_case p = { .color = color != 0, .date = { 2026, 3, 2 }, .rgb = CUI_RGB(0x7747ff) };
+        run(ui, build_picker_focus, &p, 3);
+        cui_rect r = rect_of(ui, p.id);
+        cui_vec2 top = { r.x + r.w / 2, r.y };
+        cui_sw_render(g_sw, cui_get_draw_data(ui), initial, width, height, stride, CUI_SW_RGBA);
+        key(ui, build_picker_focus, &p, CUI_KEY_TAB, 0);
+        cui_sw_render(g_sw, cui_get_draw_data(ui), focused, width, height, stride, CUI_SW_RGBA);
+        CHECK(focus_strip_changed(initial, focused, stride, height, top));
+        cui_destroy(ui);
+    }
+}
+
+/** Color edits in an open picker start from the caller's latest RGB. */
+static void test_color_picker_model_update(void) {
+    printf("color picker: external model update while open\n");
+    cui_ctx *ui = new_ctx();
+    picker_focus_case p = { .color = true, .rgb = CUI_RGB(0x7747ff) };
+    run(ui, build_picker_focus, &p, 3);
+    key(ui, build_picker_focus, &p, CUI_KEY_TAB, 0);
+    key(ui, build_picker_focus, &p, CUI_KEY_ENTER, 0);
+    p.rgb = CUI_RGB(0xff0000);
+    p.rgb.a = 100;
+    run(ui, build_picker_focus, &p, 3);
+    cui_push_id_int(ui, (int)(p.id ^ 0xC010Eu));
+    cui_rect hue = rect_of(ui, cui_make_id(ui, "#hue"));
+    cui_pop_id(ui);
+    CHECK(hue.w > 150);
+    click_at(ui, build_picker_focus, &p, hue.x + hue.w / 3, hue.y + hue.h / 2);
+    CHECK(p.rgb.r <= 1 && p.rgb.g == 255 && p.rgb.b <= 1 && p.rgb.a == 100);
+    cui_destroy(ui);
+}
+
+typedef struct { bool wheel; int index; float value; } picker_paint_case;
+
+/** Build one focusable picker with visible content at its center. */
+static void build_picker_paint(cui_ctx *ui, void *user) {
+    picker_paint_case *p = user;
+    static const char *const labels[] = { "A", "B", "Center", "D", "E" };
+    cui_column(ui, .pad = 14, .width = CUI_PX(260)) {
+        if (p->wheel) cui_wheel_picker(ui, "Wheel", labels, 5, &p->index, .width = CUI_PX(230));
+        else cui_ruler_slider(ui, "Ruler", &p->value, 0, 100, .width = CUI_PX(230));
+    }
+}
+
+/** Keyboard focus adds a ring while retaining the selected band or ruler ticks. */
+static void test_picker_focus_keeps_content(void) {
+    printf("wheel and ruler: preserve paint under keyboard focus\n");
+    enum { width = 300, height = 240, stride = width * 4 };
+    unsigned char initial[height * stride], focused[height * stride];
+    for (int wheel = 0; wheel < 2; wheel++) {
+        cui_ctx *ui = new_ctx();
+        cui_set_viewport(ui, width, height, 1);
+        cui_input_mouse_leave(ui);
+        picker_paint_case p = { .wheel = wheel != 0, .index = 2, .value = 50 };
+        run(ui, build_picker_paint, &p, 3);
+        cui_rect r = cui_last_rect(ui);
+        cui_vec2 mid = center(r), top = { mid.x, r.y };
+        bool in_bounds = r.w >= 200 && r.h >= 28 && mid.x >= 12 && mid.x + 12 < width &&
+                         mid.y >= 8 && mid.y + 8 < height;
+        CHECK(in_bounds);
+        if (!in_bounds) { cui_destroy(ui); continue; }
+        cui_sw_render(g_sw, cui_get_draw_data(ui), initial, width, height, stride, CUI_SW_RGBA);
+        key(ui, build_picker_paint, &p, CUI_KEY_TAB, 0);
+        cui_sw_render(g_sw, cui_get_draw_data(ui), focused, width, height, stride, CUI_SW_RGBA);
+        CHECK(focus_strip_changed(initial, focused, stride, height, top));
+        bool content_stable = true;
+        int x = (int)mid.x - 12;
+        int y0 = (int)mid.y - 8;
+        for (int y = y0; y < y0 + 16; y++) {
+            int offset = y * stride + x * 4;
+            if (memcmp(initial + offset, focused + offset, 24 * 4) != 0) content_stable = false;
+        }
+        CHECK(content_stable);
+        cui_destroy(ui);
+    }
 }
 
 static void test_pickers(void) {
@@ -1016,6 +2660,80 @@ static void build_disclosure(cui_ctx *ui, void *u) {
     }
 }
 
+/** Build the question in the same frame as its keyboard-activated trigger. */
+static void build_confirm_keyboard(cui_ctx *ui, void *user) {
+    bool *confirmed = user;
+    if (cui_button(ui, "Delete item")) cui_popover_open(ui, "delete");
+    *confirmed = cui_confirm_popover(ui, "delete", .title = "Delete this item?", .danger = true);
+}
+
+/** The key that opens the question must not answer it in the same frame. */
+static void test_confirm_popover_keyboard(void) {
+    printf("confirmation popover: a separate Enter confirms\n");
+    cui_ctx *ui = new_ctx();
+    bool confirmed = false;
+    run(ui, build_confirm_keyboard, &confirmed, 1);
+    key(ui, build_confirm_keyboard, &confirmed, CUI_KEY_TAB, 0);
+    key(ui, build_confirm_keyboard, &confirmed, CUI_KEY_ENTER, 0);
+    CHECK(cui_popover_is_open(ui, "delete") && !confirmed);
+    key(ui, build_confirm_keyboard, &confirmed, CUI_KEY_ENTER, 0);
+    CHECK(confirmed && !cui_popover_is_open(ui, "delete"));
+    cui_destroy(ui);
+}
+
+/** Draw just the expandable text so Tab reaches its toggle. */
+static void build_expandable_focus(cui_ctx *ui, void *user) {
+    bool *toggled = user;
+    cui_column(ui, .width = CUI_PX(240)) {
+        *toggled = cui_expandable_text(ui, "expandable", "First line\nSecond line\nThird line", .lines = 1);
+    }
+}
+
+/** Both activation keys still work when the toggle's label changes. */
+static void test_expandable_focus(void) {
+    printf("expandable text: preserve focus after toggling\n");
+    cui_ctx *ui = new_ctx();
+    bool toggled = false;
+    run(ui, build_expandable_focus, &toggled, 3);
+    key(ui, build_expandable_focus, &toggled, CUI_KEY_TAB, 0);
+    key(ui, build_expandable_focus, &toggled, CUI_KEY_ENTER, 0);
+    CHECK(toggled);
+    run(ui, build_expandable_focus, &toggled, 1);
+    key(ui, build_expandable_focus, &toggled, CUI_KEY_SPACE, 0);
+    CHECK(toggled);
+    run(ui, build_expandable_focus, &toggled, 1);
+    key(ui, build_expandable_focus, &toggled, CUI_KEY_ENTER, 0);
+    CHECK(toggled);
+    cui_destroy(ui);
+}
+
+typedef struct { bool open, enter_available; int selected; } palette_close_case;
+
+/** Record both the command and whether the palette consumed Enter. */
+static void build_palette_close(cui_ctx *ui, void *user) {
+    palette_close_case *c = user;
+    static const cui_command command = { .title = "Open" };
+    c->selected = cui_command_palette(ui, &c->open, &command, 1);
+    c->enter_available = cui_key_pressed(ui, CUI_KEY_ENTER);
+}
+
+/** A closing palette stays visible for its transition without accepting keys. */
+static void test_palette_close(void) {
+    printf("command palette: closing animation does not activate\n");
+    cui_ctx *ui = new_ctx();
+    cui_set_reduced_motion(ui, false);
+    palette_close_case c = { .open = true };
+    run(ui, build_palette_close, &c, 50);
+    c.open = false;
+    key(ui, build_palette_close, &c, CUI_KEY_ENTER, 0);
+    CHECK(c.selected == -1 && c.enter_available);
+    c.open = true;
+    run(ui, build_palette_close, &c, 3);
+    key(ui, build_palette_close, &c, CUI_KEY_ENTER, 0);
+    CHECK(c.selected == 0 && !c.open && !c.enter_available);
+    cui_destroy(ui);
+}
+
 static void test_disclosure(void) {
     printf("disclosure: hover card, confirm popover, expandables, toc, banner, checklist\n");
     cui_ctx *ui = new_ctx();
@@ -1034,9 +2752,17 @@ static void test_disclosure(void) {
     CHECK(!a.card_built);
     run(ui, build_disclosure, &a, 40);
     CHECK(a.card_built);
+    key(ui, build_disclosure, &a, CUI_KEY_ESCAPE, 0);
+    run(ui, build_disclosure, &a, 40);
+    CHECK(!a.card_built);
     cui_input_mouse_move(ui, 990, 1090);
     run(ui, build_disclosure, &a, 40);
     CHECK(!a.card_built);
+    cui_input_mouse_move(ui, l.x, l.y);
+    run(ui, build_disclosure, &a, 40);
+    CHECK(a.card_built);
+    cui_input_mouse_move(ui, 990, 1090);
+    run(ui, build_disclosure, &a, 40);
     /* confirm popover */
     cui_vec2 dl = center(rect_of(ui, a.del_id));
     click_at(ui, build_disclosure, &a, dl.x, dl.y);
@@ -1096,6 +2822,49 @@ static void test_checklist(void) {
 
 /* data grid ------------------------------------------------------------------ */
 
+/* a cell text before the first row has no column yet: it used to read cols[-1] */
+typedef struct { cui_grid_column *gcols; cui_table_column *tcols; } early_cell_ctx;
+static void build_early_cells(cui_ctx *ui, void *u) {
+    early_cell_ctx *a = u;
+    cui_column(ui, .pad = 20, .gap = 12, .width = CUI_FILL, .height = CUI_FILL) {
+        int first, last;
+        if (cui_data_grid_begin(ui, "early_grid", a->gcols, 2, 2, &first, &last, .height = CUI_PX(200))) {
+            cui_data_grid_cell_text(ui, "too early");
+            for (int r = first; r < last; r++) {
+                cui_data_grid_row(ui, r);
+                cui_data_grid_cell_text(ui, "name");
+                cui_data_grid_cell_text(ui, "1");
+            }
+            cui_data_grid_end(ui);
+        }
+        if (cui_table_begin_ex(ui, "early_table", a->tcols, 2, NULL)) {
+            cui_table_cell_text(ui, "too early");
+            for (int r = 0; r < 2; r++) {
+                cui_table_row(ui, false);
+                cui_table_cell_text(ui, "name");
+                cui_table_cell_text(ui, "1");
+            }
+            cui_table_end(ui);
+        }
+    }
+}
+static void test_cell_text_before_row(void) {
+    printf("data grid, table: cell text before the first row\n");
+    cui_ctx *ui = new_ctx();
+    early_cell_ctx a;
+    a.gcols = calloc(2, sizeof *a.gcols);   /* on the heap, so a read before the array is caught */
+    a.tcols = calloc(2, sizeof *a.tcols);
+    a.gcols[0].title = a.tcols[0].title = "Name";
+    a.gcols[1].title = a.tcols[1].title = "Value";
+    a.gcols[1].align = a.tcols[1].align = CUI_TEXT_RIGHT;
+    run(ui, build_early_cells, &a, 3);
+    CHECK(rect_of(ui, cui_make_id(ui, "early_grid")).h > 100);
+    free(a.gcols);
+    free(a.tcols);
+    cui_destroy(ui);
+}
+
+
 typedef struct { bool sel[500]; cui_table_sort sort; char names[500][16]; int committed; int cursor; bool open; uint32_t filt[2]; char q[32]; int json_ok, json_bad; cui_id grid_id, tree_id, fb_id; } dgrid_ctx;
 static void build_dgrid(cui_ctx *ui, void *u) {
     dgrid_ctx *a = u;
@@ -1123,6 +2892,160 @@ static void build_dgrid(cui_ctx *ui, void *u) {
         a->json_bad = cui_json_view(ui, "j2", "{\"a\": [1, 2,}");
         cui_code_block(ui, "code", "int main(void) {\n    return 0; /* done */\n}\n", .lang = "c", .line_numbers = true);
     }
+}
+
+/** The JSON viewer accepts valid tokens and rejects malformed numbers and escapes. */
+static void test_json_tokens(void) {
+    printf("JSON viewer: number and escape grammar\n");
+    static const struct { const char *json; bool valid; } cases[] = {
+        { "0", true }, { "-0", true }, { "-2.1e-3", true }, { "0E+1", true },
+        { "\"\\u12aF\"", true }, { "{\"a\\tb\":[\"\\\"\\/\\\\\\b\\f\\n\\r\",1.25]}", true },
+        { "-", false }, { "01", false }, { "-01", false }, { "1.", false },
+        { "1e", false }, { "1e+", false }, { "1+2", false }, { "[1..2]", false },
+        { "\"\\q\"", false }, { "\"\\u12x4\"", false }, { "\"\\u12\"", false },
+        { "{\"\\q\":0}", false }, { "\"abc\\", false },
+    };
+    cui_ctx *ui = new_ctx();
+    for (int i = 0; i < (int)(sizeof cases / sizeof cases[0]); i++) {
+        cui_begin_frame(ui, 1.0f / 60.0f);
+        bool ok = cui_json_view(ui, "value", cases[i].json);
+        cui_end_frame(ui);
+        if (ok != cases[i].valid) printf("  unexpected JSON result: %s\n", cases[i].json);
+        CHECK(ok == cases[i].valid);
+    }
+    cui_destroy(ui);
+}
+
+typedef struct { int count, first, last; } grid_range_case;
+
+/** Build only the rows in the returned range for the current grid size. */
+static void build_grid_range(cui_ctx *ui, void *user) {
+    grid_range_case *grid = user;
+    static const cui_grid_column column = { "Name", 160, CUI_TEXT_LEFT, false };
+    if (cui_data_grid_begin(ui, "shrinking grid", &column, 1, grid->count,
+                            &grid->first, &grid->last, .height = CUI_PX(160))) {
+        for (int row = grid->first; row < grid->last; row++) {
+            cui_data_grid_row(ui, row);
+            cui_data_grid_cell_text(ui, "A row");
+        }
+        cui_data_grid_end(ui);
+    }
+}
+
+/** The remaining row must be built in the same frame as the count changes. */
+static void test_data_grid_shrinks(void) {
+    printf("data grid: visible range after shrinking\n");
+    cui_ctx *ui = new_ctx();
+    grid_range_case grid = { .count = 100 };
+    run(ui, build_grid_range, &grid, 3);
+    cui_input_mouse_move(ui, 70, 90);
+    run(ui, build_grid_range, &grid, 1);
+    cui_input_scroll(ui, 0, -40);
+    run(ui, build_grid_range, &grid, 4);
+    CHECK(grid.first > 10);
+    grid.count = 1;
+    run(ui, build_grid_range, &grid, 1);
+    CHECK(grid.first == 0 && grid.last == 1);
+    grid.count = 0;
+    run(ui, build_grid_range, &grid, 1);
+    CHECK(grid.first == 0 && grid.last == 0);
+    cui_destroy(ui);
+}
+
+/** The row brought into view by Home is present in the keypress frame. */
+static void test_data_grid_home_range(void) {
+    printf("data grid: Home updates the visible range in the same frame\n");
+    cui_ctx *ui = new_ctx();
+    grid_range_case grid = { .count = 100 };
+    run(ui, build_grid_range, &grid, 3);
+    click_at(ui, build_grid_range, &grid, 70, 90);
+    cui_input_scroll(ui, 0, -40);
+    run(ui, build_grid_range, &grid, 4);
+    CHECK(grid.first > 10);
+    cui_input_key(ui, CUI_KEY_HOME, true, 0);
+    run(ui, build_grid_range, &grid, 1);
+    CHECK(grid.first == 0 && grid.last > 0);
+    cui_destroy(ui);
+}
+
+typedef struct { cui_table_sort sort; cui_rect bounds; } table_focus_case;
+
+/** Draw one sortable header and one selectable row for the focus test. */
+static void build_table_focus(cui_ctx *ui, void *user) {
+    table_focus_case *table = user;
+    const cui_table_column column = { "Name", CUI_PX(150), CUI_TEXT_LEFT, true };
+    cui_column(ui, .pad = 12) {
+        cui_table(ui, "table focus", &column, 1, .sort = &table->sort, .selectable = true) {
+            cui_table_row(ui, false);
+            cui_table_cell_text(ui, "A row");
+        }
+        table->bounds = cui_get_rect(ui, cui_make_id(ui, "table focus"));
+    }
+}
+
+/** The focused header and row each draw a ring at their own bounds. */
+static void test_table_focus(void) {
+    printf("table: visible keyboard focus on header and row\n");
+    enum { width = 300, height = 124, stride = width * 4 };
+    unsigned char initial[height * stride], pixels[height * stride];
+    table_focus_case table = { .sort = { .column = -1 } };
+    cui_ctx *ui = new_ctx();
+    cui_set_viewport(ui, width, height, 1);
+    cui_input_mouse_leave(ui);
+    run(ui, build_table_focus, &table, 3);
+    CHECK(table.bounds.w >= 150 && table.bounds.h >= 80);
+    cui_vec2 header_top = { table.bounds.x + 80, table.bounds.y + 5 };
+    cui_vec2 row_top = { table.bounds.x + 80, table.bounds.y + 44 };
+    cui_sw_render(g_sw, cui_get_draw_data(ui), initial, width, height, stride, CUI_SW_RGBA);
+    key(ui, build_table_focus, &table, CUI_KEY_TAB, 0);
+    cui_sw_render(g_sw, cui_get_draw_data(ui), pixels, width, height, stride, CUI_SW_RGBA);
+    CHECK(focus_strip_changed(initial, pixels, stride, height, header_top));
+    CHECK(!focus_strip_changed(initial, pixels, stride, height, row_top));
+    key(ui, build_table_focus, &table, CUI_KEY_TAB, 0);
+    cui_sw_render(g_sw, cui_get_draw_data(ui), pixels, width, height, stride, CUI_SW_RGBA);
+    CHECK(!focus_strip_changed(initial, pixels, stride, height, header_top));
+    CHECK(focus_strip_changed(initial, pixels, stride, height, row_top));
+    cui_destroy(ui);
+}
+
+/** Draw one filter field whose only value is easy to select from the popup. */
+static void build_filter_handoff(cui_ctx *ui, void *user) {
+    static const char *const options[] = { "Engine" };
+    static const cui_filter_field field = { "Team", NULL, options, 1 };
+    cui_column(ui, .pad = 20) {
+        cui_filter_bar(ui, "team filters", &field, 1, user, NULL, 0);
+    }
+}
+
+/** Selecting a field opens its values without requiring an extra chip click. */
+static void test_filter_handoff(void) {
+    printf("filter bar: selecting a field opens its values\n");
+    cui_ctx *ui = new_ctx();
+    uint32_t selected = 0;
+    run(ui, build_filter_handoff, &selected, 3);
+    key(ui, build_filter_handoff, &selected, CUI_KEY_TAB, 0);
+    key(ui, build_filter_handoff, &selected, CUI_KEY_ENTER, 0);
+    key(ui, build_filter_handoff, &selected, CUI_KEY_DOWN, 0);
+    key(ui, build_filter_handoff, &selected, CUI_KEY_ENTER, 0);
+    run(ui, build_filter_handoff, &selected, 3);
+    CHECK(selected == 0);
+    cui_push_id(ui, "team filters");
+    cui_push_id_int(ui, 0);
+    cui_id chip_id = cui_make_id(ui, "chip");
+    cui_rect chip = cui_get_rect(ui, chip_id);
+    cui_push_id_int(ui, (int)(chip_id ^ 0x3E40u));
+    cui_push_id_int(ui, 0);
+    cui_rect option = cui_get_rect(ui, cui_make_id(ui, "Engine"));
+    cui_pop_id(ui);
+    cui_pop_id(ui);
+    cui_pop_id(ui);
+    cui_pop_id(ui);
+    CHECK(chip.w > 0);
+    CHECK(option.w > 0);
+    cui_vec2 at = center(option);
+    click_at(ui, build_filter_handoff, &selected, at.x, at.y);
+    CHECK(selected == 1);
+    cui_destroy(ui);
 }
 
 static void test_data_grid(void) {
@@ -1219,15 +3142,23 @@ typedef struct {
     int activated, expanded, collapsed, loads, load_node, sort_changes, sel_changes;
     cui_id grid_id;
     const char *const *names;
+    bool draggable, apply, refuse_inside;      /* drag and drop: apply moves the nodes with cui_tree_move */
+    bool disabled;                             /* builds the table in a disabled scope */
+    int drops, drop_target, drop_where, drop_count, dropped[8];
+    bool menu, menu_shown;                     /* menu: builds the context menu; menu_shown: it was built this frame */
+    int menu_node, menu_chosen;
 } ttab_ctx;
 static const char *ttab_label(void *user, int n) { ttab_ctx *t = user; return t->names ? t->names[n] : NULL; }
+static bool ttab_can_drop(void *user, int target, int where) { ttab_ctx *t = user; (void)target; return !(t->refuse_inside && where == CUI_TREE_DROP_INSIDE); }
 static void build_ttab(cui_ctx *ui, void *u) {
     ttab_ctx *t = u;
     cui_column(ui, .pad = 20, .width = CUI_FILL, .height = CUI_FILL) {
+        if (t->disabled) cui_push_disabled(ui, true);
         static const cui_grid_column cols[] = { { "Name", 240, CUI_TEXT_LEFT, true }, { "Value", 120, CUI_TEXT_RIGHT, true, false, 1 },
                                                 { "Type", 120, CUI_TEXT_LEFT, true, false, 2 } };
         cui_tree_table_begin(ui, "tt", cols, 3, t->nodes, t->count, .height = CUI_PX(t->height > 0 ? t->height : 360), .root = t->root,
-                             .sort = &t->sort, .cursor = &t->cursor, .guides = true, .label = ttab_label, .user = t);
+                             .sort = &t->sort, .cursor = &t->cursor, .guides = true, .label = ttab_label, .user = t,
+                             .draggable = t->draggable, .can_drop = ttab_can_drop);
         t->grid_id = cui_make_id(ui, "tt");
         t->nseq = 0; t->rows_built = 0;
         int n;
@@ -1248,6 +3179,21 @@ static void build_ttab(cui_ctx *ui, void *u) {
         if (ev.load_count > 0) t->load_node = ev.load[0];
         t->sort_changes += ev.sort_changed;
         t->sel_changes += ev.selection_changed;
+        if (ev.drop_count > 0) {
+            t->drops++;
+            t->drop_target = ev.drop_target; t->drop_where = ev.drop_where; t->drop_count = ev.drop_count;
+            for (int k = 0; k < ev.drop_count && k < 8; k++) t->dropped[k] = ev.dropped[k];
+            if (t->apply) t->root = cui_tree_move(t->nodes, t->count, t->root, ev.dropped, ev.drop_count, ev.drop_target, ev.drop_where);
+        }
+        t->menu_shown = false;
+        int node = -1;
+        if (t->menu) cui_tree_table_menu(ui, "tt", &node) {
+            t->menu_shown = true;
+            t->menu_node = node;
+            if (cui_menu_item(ui, "Rename")) t->menu_chosen = node;
+            cui_menu_item(ui, "Delete");
+        }
+        if (t->disabled) cui_pop_disabled(ui);
     }
 }
 static void ttab_link(cui_tree_node *nd, int parent, const int *kids, int n) {
@@ -1612,6 +3558,360 @@ static void test_tree_table(void) {
     }
 }
 
+/* A frame without the table: another page is showing. */
+static void build_ttab_gone(cui_ctx *ui, void *u) { (void)u; cui_text(ui, "elsewhere"); }
+/* Presses at (x, y0), drags to y1 in a few steps, rests there `hold` frames, then lets go. */
+static void ttab_drag(cui_ctx *ui, ttab_ctx *t, float x, float y0, float y1, int hold) {
+    cui_input_mouse_move(ui, x, y0);
+    run(ui, build_ttab, t, 1);
+    cui_input_mouse_button(ui, CUI_MOUSE_LEFT, true);
+    run(ui, build_ttab, t, 1);
+    for (int i = 1; i <= 6; i++) { cui_input_mouse_move(ui, x, y0 + (y1 - y0) * i / 6); run(ui, build_ttab, t, 1); }
+    run(ui, build_ttab, t, hold);
+    cui_input_mouse_button(ui, CUI_MOUSE_LEFT, false);
+    run(ui, build_ttab, t, 2);
+}
+static float ttab_row_top(cui_rect g, int i) { return g.y + 40 + 32 * i; }
+static bool ttab_kids(const cui_tree_node *nd, int parent, const int *want, int n) {
+    int c = parent >= 0 ? nd[parent].first_child : -1;
+    for (int k = 0; k < n; k++, c = nd[c].next_sibling) if (c != want[k] || nd[c].parent != parent) return false;
+    return c == -1;
+}
+
+static void ttab_right_click(cui_ctx *ui, ttab_ctx *t, float x, float y) {
+    cui_input_mouse_move(ui, x, y);
+    run(ui, build_ttab, t, 1);
+    cui_input_mouse_button(ui, CUI_MOUSE_RIGHT, true);
+    run(ui, build_ttab, t, 1);
+    cui_input_mouse_button(ui, CUI_MOUSE_RIGHT, false);
+    run(ui, build_ttab, t, 1);
+}
+
+static void test_tree_table_menu(void) {
+    printf("tree table context menu: the node under the pointer, selection, Shift+F10, keys, closing\n");
+    cui_ctx *ui = new_ctx();
+    cui_set_viewport(ui, 900, 600, 1);
+    /* 0 A { 1 A1 { 3 A1a }, 2 A2 }, 4 B { 5 B1 }, 6 C; rows A, A1, A2, B, C */
+    cui_tree_node nd[8];
+    for (int k = 0; k < 8; k++) { nd[k].parent = nd[k].first_child = nd[k].next_sibling = -1; nd[k].flags = 0; }
+    { int top[] = { 0, 4, 6 }, a[] = { 1, 2 }, a1[] = { 3 }, bb[] = { 5 };
+      ttab_link(nd, -1, top, 3); ttab_link(nd, 0, a, 2); ttab_link(nd, 1, a1, 1); ttab_link(nd, 4, bb, 1); }
+    nd[0].flags = nd[1].flags = nd[4].flags = CUI_TREE_HAS_CHILDREN;
+    nd[0].flags |= CUI_TREE_OPEN;
+    ttab_ctx t;
+    memset(&t, 0, sizeof t);
+    t.nodes = nd; t.count = 7; t.cursor = -1; t.sort.column = -1;
+    t.activated = t.expanded = t.collapsed = -1;
+    t.draggable = true;
+    t.menu_node = t.menu_chosen = -1;
+    run(ui, build_ttab, &t, 3);
+    cui_rect g = rect_of(ui, t.grid_id);
+    /* without a menu the right button does nothing */
+    ttab_right_click(ui, &t, g.x + 300, ttab_row_y(g, 3));
+    CHECK(ttab_selected(&t) == 0 && t.cursor == -1);
+    /* a right click opens the menu for the row under the pointer and selects it */
+    t.menu = true;
+    run(ui, build_ttab, &t, 1);
+    ttab_right_click(ui, &t, g.x + 300, ttab_row_y(g, 3));
+    CHECK(t.menu_shown && t.menu_node == 4);
+    CHECK(t.cursor == 4 && (nd[4].flags & CUI_TREE_SELECTED) && ttab_selected(&t) == 1);
+    CHECK(t.drops == 0 && !(nd[4].flags & CUI_TREE_OPEN));
+    /* inside a selection of several, the selection stays */
+    cui_input_mouse_leave(ui);
+    key(ui, build_ttab, &t, CUI_KEY_ESCAPE, 0);   /* closes the menu; the selection stays */
+    run(ui, build_ttab, &t, 30);
+    CHECK(!t.menu_shown && ttab_selected(&t) == 1);
+    click_at(ui, build_ttab, &t, g.x + 300, ttab_row_y(g, 1));
+    key(ui, build_ttab, &t, CUI_KEY_DOWN, CUI_MOD_SHIFT);
+    CHECK(ttab_selected(&t) == 2 && t.cursor == 2);
+    ttab_right_click(ui, &t, g.x + 300, ttab_row_y(g, 1));
+    CHECK(t.menu_shown && t.menu_node == 1 && t.cursor == 1);
+    CHECK((nd[1].flags & CUI_TREE_SELECTED) && (nd[2].flags & CUI_TREE_SELECTED) && ttab_selected(&t) == 2);
+    /* another row while it is open: the menu moves to that node */
+    ttab_right_click(ui, &t, g.x + 300, ttab_row_y(g, 4));
+    CHECK(t.menu_shown && t.menu_node == 6 && ttab_selected(&t) == 1 && (nd[6].flags & CUI_TREE_SELECTED));
+    /* the open menu takes the keys: Down and Enter pick an item, the tree stays */
+    cui_input_mouse_leave(ui);
+    run(ui, build_ttab, &t, 1);
+    key(ui, build_ttab, &t, CUI_KEY_DOWN, 0);
+    key(ui, build_ttab, &t, CUI_KEY_ENTER, 0);
+    CHECK(t.menu_chosen == 6 && t.cursor == 6 && t.activated == -1);
+    run(ui, build_ttab, &t, 30);
+    CHECK(!t.menu_shown);
+    /* Shift+F10 opens it for the cursor row; Down then moves in the menu, not the tree */
+    key(ui, build_ttab, &t, CUI_KEY_UP, 0);
+    CHECK(t.cursor == 4);
+    key(ui, build_ttab, &t, CUI_KEY_F10, CUI_MOD_SHIFT);
+    CHECK(t.menu_shown && t.menu_node == 4 && (nd[4].flags & CUI_TREE_SELECTED));
+    key(ui, build_ttab, &t, CUI_KEY_DOWN, 0);
+    CHECK(t.cursor == 4);
+    key(ui, build_ttab, &t, CUI_KEY_ESCAPE, 0);
+    run(ui, build_ttab, &t, 30);
+    CHECK(!t.menu_shown && t.cursor == 4);
+    /* the chevron belongs to its row: a right click there opens the menu and leaves the folder as it was */
+    ttab_right_click(ui, &t, g.x + 22, ttab_row_y(g, 0));
+    CHECK(t.menu_shown && t.menu_node == 0 && (nd[0].flags & CUI_TREE_OPEN));
+    /* the menu closes when its node is hidden */
+    ttab_right_click(ui, &t, g.x + 300, ttab_row_y(g, 2));
+    CHECK(t.menu_shown && t.menu_node == 2);
+    nd[0].flags &= ~(uint32_t)CUI_TREE_OPEN;
+    run(ui, build_ttab, &t, 30);
+    CHECK(!t.menu_shown);
+    /* and when the caller stops building it */
+    ttab_right_click(ui, &t, g.x + 300, ttab_row_y(g, 0));
+    CHECK(t.menu_shown && t.menu_node == 0);
+    t.menu = false;
+    run(ui, build_ttab, &t, 3);
+    t.menu = true;
+    run(ui, build_ttab, &t, 30);
+    CHECK(!t.menu_shown);
+    /* not while a row is held to drag: neither a right press nor Shift+F10 opens it, and the drop still lands */
+    { int drops = t.drops;
+      float x = g.x + 300, y = ttab_row_y(g, 1);
+      cui_input_mouse_move(ui, x, y);
+      run(ui, build_ttab, &t, 1);
+      cui_input_mouse_button(ui, CUI_MOUSE_LEFT, true);
+      run(ui, build_ttab, &t, 1);
+      ttab_right_click(ui, &t, x, y);   /* the left button is still down: the press may become a drag */
+      CHECK(!t.menu_shown);
+      for (int i = 1; i <= 4; i++) { cui_input_mouse_move(ui, x, y + 8 * i); run(ui, build_ttab, &t, 1); }
+      key(ui, build_ttab, &t, CUI_KEY_F10, CUI_MOD_SHIFT);
+      CHECK(!t.menu_shown);
+      cui_input_mouse_button(ui, CUI_MOUSE_LEFT, false);
+      run(ui, build_ttab, &t, 2);
+      CHECK(!t.menu_shown && t.drops == drops + 1); }
+    /* a table that becomes disabled closes its menu, and it stays closed when the table comes back */
+    ttab_right_click(ui, &t, g.x + 300, ttab_row_y(g, 0));
+    CHECK(t.menu_shown);
+    t.disabled = true;
+    run(ui, build_ttab, &t, 30);
+    CHECK(!t.menu_shown);
+    t.disabled = false;
+    run(ui, build_ttab, &t, 30);
+    CHECK(!t.menu_shown);
+    cui_destroy(ui);
+}
+
+static void test_tree_table_drag(void) {
+    printf("tree table drag and drop: targets, hold to open, Esc, refusals, several nodes, edge scroll; cui_tree_move\n");
+    cui_ctx *ui = new_ctx();
+    cui_set_viewport(ui, 900, 600, 1);
+    /* 0 A { 1 A1 { 3 A1a }, 2 A2 }, 4 B { 5 B1 }, 6 C */
+    cui_tree_node nd[8];
+    for (int k = 0; k < 8; k++) { nd[k].parent = nd[k].first_child = nd[k].next_sibling = -1; nd[k].flags = 0; }
+    { int top[] = { 0, 4, 6 }, a[] = { 1, 2 }, a1[] = { 3 }, bb[] = { 5 };
+      ttab_link(nd, -1, top, 3); ttab_link(nd, 0, a, 2); ttab_link(nd, 1, a1, 1); ttab_link(nd, 4, bb, 1); }
+    nd[0].flags = nd[1].flags = nd[4].flags = CUI_TREE_HAS_CHILDREN;
+    static const char *const names[] = { "Alpha", "Apple", "Avocado", "Apricot", "Banana", "Blueberry", "Cherry" };
+    ttab_ctx t;
+    memset(&t, 0, sizeof t);
+    t.nodes = nd; t.count = 7; t.cursor = -1; t.names = names; t.sort.column = -1;
+    t.activated = t.expanded = t.collapsed = -1;
+    t.draggable = true; t.apply = true;
+    run(ui, build_ttab, &t, 3);
+    cui_rect g = rect_of(ui, t.grid_id);
+    float x = g.x + 300;
+    /* a press that does not move is a click: it selects, nothing drops */
+    click_at(ui, build_ttab, &t, x, ttab_row_y(g, 1));
+    CHECK(t.drops == 0 && ttab_selected(&t) == 1 && (nd[4].flags & CUI_TREE_SELECTED));
+    /* drag C (row 2, not selected) to the top edge of A: it goes before A and becomes the selection */
+    ttab_drag(ui, &t, x, ttab_row_y(g, 2), ttab_row_top(g, 0) + 4, 0);
+    CHECK(t.drops == 1 && t.drop_count == 1 && t.dropped[0] == 6 && t.drop_target == 0 && t.drop_where == CUI_TREE_DROP_BEFORE);
+    { int w[] = { 6, 0, 4 }; CHECK(t.root == 6 && ttab_seq(&t, w, 3)); }
+    CHECK(ttab_selected(&t) == 1 && (nd[6].flags & CUI_TREE_SELECTED));   /* the release over A did not click it */
+    /* drag B by its name into the middle of A: it becomes A's last child */
+    ttab_drag(ui, &t, g.x + 80, ttab_row_y(g, 2), ttab_row_y(g, 1), 0);
+    CHECK(t.drops == 2 && t.dropped[0] == 4 && t.drop_target == 0 && t.drop_where == CUI_TREE_DROP_INSIDE);
+    { int w[] = { 1, 2, 4 }; CHECK(ttab_kids(nd, 0, w, 3) && nd[6].next_sibling == 0 && nd[0].next_sibling == -1); }
+    /* the bottom half of a leaf is after it; below the last row is after the last top level node */
+    ttab_drag(ui, &t, x, ttab_row_y(g, 0), ttab_row_top(g, 1) - 6, 0);   /* C onto its own row: refused */
+    CHECK(t.drops == 2);
+    ttab_drag(ui, &t, x, ttab_row_y(g, 0), ttab_row_y(g, 4), 0);   /* rows: A, C... below both */
+    CHECK(t.drops == 3 && t.drop_target == 0 && t.drop_where == CUI_TREE_DROP_AFTER);
+    { int w[] = { 0, 6 }; CHECK(t.root == 0 && ttab_seq(&t, w, 2)); }
+    /* holding the drag on a closed folder opens it; the line under an open folder is before its first child */
+    ttab_drag(ui, &t, x, ttab_row_y(g, 1), ttab_row_y(g, 0), 45);
+    CHECK((nd[0].flags & CUI_TREE_OPEN) && t.expanded == 0);
+    CHECK(t.drops == 4 && t.drop_target == 0 && t.drop_where == CUI_TREE_DROP_INSIDE);   /* still over A's middle */
+    { int w[] = { 1, 2, 4, 6 }; CHECK(ttab_kids(nd, 0, w, 4)); }
+    run(ui, build_ttab, &t, 2);
+    { int w[] = { 0, 1, 2, 4, 6 }; CHECK(ttab_seq(&t, w, 5)); }
+    ttab_drag(ui, &t, x, ttab_row_y(g, 4), ttab_row_top(g, 1) - 4, 0);   /* C to the bottom quarter of open A */
+    CHECK(t.drops == 5 && t.drop_target == 1 && t.drop_where == CUI_TREE_DROP_BEFORE);
+    { int w[] = { 6, 1, 2, 4 }; CHECK(ttab_kids(nd, 0, w, 4)); }
+    /* a node may not go into itself or its own subtree */
+    ttab_drag(ui, &t, x, ttab_row_y(g, 0), ttab_row_y(g, 2), 0);   /* A onto A1 */
+    CHECK(t.drops == 5);
+    /* Esc cancels the drag; the selection stays */
+    click_at(ui, build_ttab, &t, x, ttab_row_y(g, 3));
+    cui_input_mouse_button(ui, CUI_MOUSE_LEFT, true);
+    run(ui, build_ttab, &t, 1);
+    for (int i = 1; i <= 4; i++) { cui_input_mouse_move(ui, x, ttab_row_y(g, 3) - 8 * i); run(ui, build_ttab, &t, 1); }
+    key(ui, build_ttab, &t, CUI_KEY_ESCAPE, 0);
+    cui_input_mouse_button(ui, CUI_MOUSE_LEFT, false);
+    run(ui, build_ttab, &t, 2);
+    CHECK(t.drops == 5 && ttab_selected(&t) == 1 && (nd[2].flags & CUI_TREE_SELECTED));
+    /* can_drop refuses: a folder's middle is then no target */
+    t.refuse_inside = true;
+    ttab_drag(ui, &t, x, ttab_row_y(g, 1), ttab_row_y(g, 4), 0);   /* C into the middle of B */
+    CHECK(t.drops == 5);
+    t.refuse_inside = false;
+    /* several selected nodes move together in tree order; A1's child goes with it */
+    { int w[] = { 0, 6, 1, 2, 4 }; CHECK(ttab_seq(&t, w, 5)); }
+    click_at(ui, build_ttab, &t, x, ttab_row_y(g, 2));   /* A1 */
+    cui_input_key(ui, CUI_KEY_NONE, false, CUI_MOD_PRIMARY);
+    click_at(ui, build_ttab, &t, x, ttab_row_y(g, 4));   /* + B */
+    click_at(ui, build_ttab, &t, x, ttab_row_y(g, 1));   /* + C */
+    cui_input_key(ui, CUI_KEY_NONE, false, 0);
+    CHECK(ttab_selected(&t) == 3);
+    ttab_drag(ui, &t, x, ttab_row_y(g, 4), ttab_row_y(g, 6) + 40, 0);   /* below the last row: after A */
+    CHECK(t.drops == 6 && t.drop_count == 3 && t.dropped[0] == 6 && t.dropped[1] == 1 && t.dropped[2] == 4);
+    { int w[] = { 2 }; CHECK(ttab_kids(nd, 0, w, 1)); }
+    CHECK(nd[0].next_sibling == 6 && nd[6].next_sibling == 1 && nd[1].next_sibling == 4 && nd[4].next_sibling == -1);
+    CHECK(nd[6].parent == -1 && nd[1].parent == -1 && nd[4].parent == -1 && nd[1].first_child == 3 && ttab_selected(&t) == 3);
+    /* moved past the threshold and let go between two frames: that is a drop, not a click */
+    { int w[] = { 0, 2, 6, 1, 4 }; CHECK(ttab_seq(&t, w, 5)); }
+    cui_input_mouse_move(ui, x, ttab_row_y(g, 1));   /* A2 */
+    run(ui, build_ttab, &t, 1);
+    cui_input_mouse_button(ui, CUI_MOUSE_LEFT, true);
+    run(ui, build_ttab, &t, 1);
+    cui_input_mouse_move(ui, x, ttab_row_top(g, 4) + 4);   /* the top quarter of B */
+    cui_input_mouse_button(ui, CUI_MOUSE_LEFT, false);
+    run(ui, build_ttab, &t, 2);
+    CHECK(t.drops == 7 && t.drop_count == 1 && t.dropped[0] == 2 && t.drop_target == 4 && t.drop_where == CUI_TREE_DROP_BEFORE);
+    CHECK(nd[0].first_child == -1 && nd[1].next_sibling == 2 && nd[2].next_sibling == 4 && ttab_selected(&t) == 1);
+    /* the drop is where the button went up, even when the pointer moves on before the next frame */
+    { int w[] = { 0, 6, 1, 2, 4 }; CHECK(ttab_seq(&t, w, 5)); }
+    cui_input_mouse_move(ui, x, ttab_row_y(g, 4));   /* B */
+    run(ui, build_ttab, &t, 1);
+    cui_input_mouse_button(ui, CUI_MOUSE_LEFT, true);
+    run(ui, build_ttab, &t, 1);
+    for (int i = 1; i <= 4; i++) { cui_input_mouse_move(ui, x, ttab_row_y(g, 4) - 16 * i); run(ui, build_ttab, &t, 1); }   /* the middle of A1 */
+    cui_input_mouse_button(ui, CUI_MOUSE_LEFT, false);
+    cui_input_mouse_move(ui, x, ttab_row_top(g, 0) + 4);   /* then on to the top of A */
+    run(ui, build_ttab, &t, 2);
+    CHECK(t.drops == 8 && t.dropped[0] == 4 && t.drop_target == 1 && t.drop_where == CUI_TREE_DROP_INSIDE);
+    { int w[] = { 3, 4 }; CHECK(ttab_kids(nd, 1, w, 2)); }
+    /* a table disabled during a drag ends it: the release drops nothing */
+    nd[1].flags &= ~(uint32_t)CUI_TREE_OPEN;
+    run(ui, build_ttab, &t, 2);
+    { int w[] = { 0, 6, 1, 2 }; CHECK(ttab_seq(&t, w, 4)); }
+    cui_input_mouse_move(ui, x, ttab_row_y(g, 1));   /* C */
+    run(ui, build_ttab, &t, 1);
+    cui_input_mouse_button(ui, CUI_MOUSE_LEFT, true);
+    run(ui, build_ttab, &t, 1);
+    for (int i = 1; i <= 3; i++) { cui_input_mouse_move(ui, x, ttab_row_y(g, 1) + 10 * i); run(ui, build_ttab, &t, 1); }   /* after A1 */
+    t.disabled = true;
+    run(ui, build_ttab, &t, 1);
+    cui_input_mouse_button(ui, CUI_MOUSE_LEFT, false);
+    run(ui, build_ttab, &t, 2);
+    t.disabled = false;
+    run(ui, build_ttab, &t, 2);
+    CHECK(t.drops == 8 && nd[0].next_sibling == 6 && nd[6].next_sibling == 1);
+    /* let go and pressed again before the next frame: the first drop still lands where it was let go */
+    { int w[] = { 0, 6, 1, 2 }; CHECK(ttab_seq(&t, w, 4)); }
+    cui_input_mouse_move(ui, x, ttab_row_y(g, 3));   /* A2 */
+    run(ui, build_ttab, &t, 1);
+    cui_input_mouse_button(ui, CUI_MOUSE_LEFT, true);
+    run(ui, build_ttab, &t, 1);
+    for (int i = 1; i <= 4; i++) { cui_input_mouse_move(ui, x, ttab_row_y(g, 3) + (ttab_row_top(g, 0) + 4 - ttab_row_y(g, 3)) * i / 4); run(ui, build_ttab, &t, 1); }
+    cui_input_mouse_button(ui, CUI_MOUSE_LEFT, false);   /* over the top of A */
+    cui_input_mouse_move(ui, x, ttab_row_y(g, 2));
+    cui_input_mouse_button(ui, CUI_MOUSE_LEFT, true);
+    run(ui, build_ttab, &t, 1);
+    cui_input_mouse_move(ui, x, ttab_row_top(g, 2) - 4);   /* the second press goes on to after C */
+    run(ui, build_ttab, &t, 1);
+    cui_input_mouse_button(ui, CUI_MOUSE_LEFT, false);
+    run(ui, build_ttab, &t, 2);
+    CHECK(t.drops == 9 && t.dropped[0] == 2 && t.drop_target == 0 && t.drop_where == CUI_TREE_DROP_BEFORE && t.root == 2);
+    cui_destroy(ui);
+
+    /* the rows scroll while the drag rests near the bottom edge */
+    ui = new_ctx();
+    cui_set_viewport(ui, 900, 600, 1);
+    cui_tree_node many[100];
+    for (int k = 0; k < 100; k++) { many[k].parent = -1; many[k].first_child = -1; many[k].next_sibling = k + 1 < 100 ? k + 1 : -1; many[k].flags = 0; }
+    memset(&t, 0, sizeof t);
+    t.nodes = many; t.count = 100; t.cursor = -1; t.sort.column = -1; t.activated = -1;
+    t.draggable = true; t.height = 300;
+    run(ui, build_ttab, &t, 3);
+    g = rect_of(ui, t.grid_id);
+    CHECK(t.seq[0] == 0);
+    ttab_drag(ui, &t, g.x + 300, ttab_row_y(g, 0), g.y + g.h - 4, 60);
+    CHECK(t.seq[0] > 0 && t.drops == 1 && t.dropped[0] == 0 && t.drop_where != CUI_TREE_DROP_INSIDE && t.drop_target > 5);
+    /* a table left out of a frame mid-drag ends the drag: let go elsewhere, it drops nothing on its return */
+    {
+        float x = g.x + 300;
+        cui_input_mouse_move(ui, x, ttab_row_y(g, 1));
+        run(ui, build_ttab, &t, 1);
+        cui_input_mouse_button(ui, CUI_MOUSE_LEFT, true);
+        run(ui, build_ttab, &t, 1);
+        for (int i = 1; i <= 4; i++) { cui_input_mouse_move(ui, x, ttab_row_y(g, 1) + 12 * i); run(ui, build_ttab, &t, 1); }
+        run(ui, build_ttab_gone, &t, 2);
+        cui_input_mouse_button(ui, CUI_MOUSE_LEFT, false);
+        run(ui, build_ttab_gone, &t, 2);
+        run(ui, build_ttab, &t, 3);
+        CHECK(t.drops == 1);
+        /* the same for a press that had not moved far enough yet: on its return the pointer is elsewhere */
+        cui_input_mouse_move(ui, x, ttab_row_y(g, 3));
+        run(ui, build_ttab, &t, 1);
+        cui_input_mouse_button(ui, CUI_MOUSE_LEFT, true);
+        run(ui, build_ttab, &t, 1);
+        run(ui, build_ttab_gone, &t, 1);
+        cui_input_mouse_button(ui, CUI_MOUSE_LEFT, false);
+        run(ui, build_ttab_gone, &t, 1);
+        cui_input_mouse_move(ui, x, ttab_row_y(g, 6));
+        run(ui, build_ttab_gone, &t, 1);
+        run(ui, build_ttab, &t, 3);
+        CHECK(t.drops == 1);
+        /* a drag after its return still works */
+        ttab_drag(ui, &t, x, ttab_row_y(g, 0), ttab_row_y(g, 3), 0);
+        CHECK(t.drops == 2 && t.drop_count == 1);
+    }
+    /* the drag carries the selection, also when Shift+Down grows it mid-drag: all three move, in order */
+    {
+        float x = g.x + 300;
+        cui_input_mouse_move(ui, x, ttab_row_y(g, 1));
+        run(ui, build_ttab, &t, 1);
+        cui_input_mouse_button(ui, CUI_MOUSE_LEFT, true);
+        run(ui, build_ttab, &t, 1);
+        for (int i = 1; i <= 4; i++) { cui_input_mouse_move(ui, x, ttab_row_y(g, 1) + 12 * i); run(ui, build_ttab, &t, 1); }
+        key(ui, build_ttab, &t, CUI_KEY_DOWN, CUI_MOD_SHIFT);
+        key(ui, build_ttab, &t, CUI_KEY_DOWN, CUI_MOD_SHIFT);
+        cui_input_mouse_move(ui, x, ttab_row_y(g, 7));
+        run(ui, build_ttab, &t, 1);
+        cui_input_mouse_button(ui, CUI_MOUSE_LEFT, false);
+        run(ui, build_ttab, &t, 2);
+        int sel = 0;
+        for (int k = 0; k < 100; k++) sel += (many[k].flags & CUI_TREE_SELECTED) != 0;
+        CHECK(t.drops == 3 && t.drop_count == 3 && sel == 3);
+        CHECK(many[t.dropped[0]].next_sibling == t.dropped[1] && many[t.dropped[1]].next_sibling == t.dropped[2]);
+        for (int k = 0; k < 3 && k < t.drop_count; k++) CHECK(many[t.dropped[k]].flags & CUI_TREE_SELECTED);
+    }
+    cui_destroy(ui);
+
+    /* cui_tree_move on its own: 0 { 3, 4 }, 1, 2 */
+    cui_tree_node m[6];
+    for (int k = 0; k < 6; k++) { m[k].parent = m[k].first_child = m[k].next_sibling = -1; m[k].flags = 0; }
+    { int top[] = { 0, 1, 2 }, kids[] = { 3, 4 }; ttab_link(m, -1, top, 3); ttab_link(m, 0, kids, 2); }
+    int root;
+    { int mv[] = { 1, 2 }, w[] = { 3, 1, 2, 4 };   /* after a child, in their order */
+      root = cui_tree_move(m, 6, 0, mv, 2, 3, CUI_TREE_DROP_AFTER);
+      CHECK(root == 0 && ttab_kids(m, 0, w, 4) && m[0].next_sibling == -1); }
+    { int mv[] = { 0 };   /* into its own child, or next to itself: nothing */
+      root = cui_tree_move(m, 6, root, mv, 1, 4, CUI_TREE_DROP_INSIDE);
+      CHECK(root == 0 && m[0].parent == -1 && m[4].first_child == -1);
+      CHECK(cui_tree_move(m, 6, root, mv, 1, 0, CUI_TREE_DROP_AFTER) == 0 && m[0].next_sibling == -1); }
+    { int mv[] = { 4, 3 }, w[] = { 1, 2 };   /* before the first top level node: a new root */
+      root = cui_tree_move(m, 6, root, mv, 2, 0, CUI_TREE_DROP_BEFORE);
+      CHECK(root == 4 && m[4].next_sibling == 3 && m[3].next_sibling == 0 && m[3].parent == -1 && ttab_kids(m, 0, w, 2)); }
+    { int mv[] = { 5 };   /* a node not linked yet goes in as a child */
+      CHECK(cui_tree_move(m, 6, root, mv, 1, 2, CUI_TREE_DROP_INSIDE) == 4 && m[2].first_child == 5 && m[5].parent == 2); }
+    { int mv[] = { 9 }; CHECK(cui_tree_move(m, 6, root, mv, 1, 2, CUI_TREE_DROP_AFTER) == root && m[2].next_sibling == -1); }
+    { int mv[] = { 1, 1 };   /* a node listed twice: nothing moves (it would link after itself) */
+      CHECK(cui_tree_move(m, 6, root, mv, 2, 0, CUI_TREE_DROP_AFTER) == root && m[0].first_child == 1 && m[1].next_sibling == 2 && m[0].next_sibling == -1); }
+}
+
 static void test_text_capacity(void) {
     printf("text input: respects buffer capacity\n");
     cui_ctx *ui = new_ctx();
@@ -1666,6 +3966,158 @@ static void test_dialog(void) {
     cui_destroy(ui);
 }
 
+typedef struct { bool open; char text[32]; } dialog_edit_ctx;
+
+static void build_dialog_edit(cui_ctx *ui, void *user) {
+    dialog_edit_ctx *d = user;
+    cui_dialog(ui, "Edit profile", &d->open) {
+        cui_input(ui, "Name", d->text, sizeof d->text, .autofocus = true);
+    }
+}
+
+/** Consecutive Escapes first leave the field, then dismiss its dialog. */
+static void test_dialog_escape_after_edit(void) {
+    printf("dialog: Escape after an active editor\n");
+    cui_ctx *ui = new_ctx();
+    dialog_edit_ctx d = { true, "Example" };
+    run(ui, build_dialog_edit, &d, 1);
+    CHECK(cui_wants_keyboard(ui));
+    key(ui, build_dialog_edit, &d, CUI_KEY_ESCAPE, 0);
+    CHECK(d.open && !cui_wants_keyboard(ui));
+    key(ui, build_dialog_edit, &d, CUI_KEY_ESCAPE, 0);
+    CHECK(!d.open);
+    cui_destroy(ui);
+}
+
+typedef struct { bool open, draggable, resizable; int inside; cui_id button; } dlg_move_ctx;
+
+static void build_dialog_move(cui_ctx *ui, void *u) {
+    dlg_move_ctx *d = u;
+    cui_dialog(ui, "Move me", &d->open, .draggable = d->draggable, .resizable = d->resizable) {
+        cui_box_begin(ui, &(cui_box){ .width = CUI_FILL, .height = CUI_PX(40) });
+        cui_box_end(ui);
+        if (cui_button(ui, "Inside")) d->inside++;
+        d->button = cui_last_id(ui);
+    }
+}
+
+/* The dialog's own ids, from the same derivation cui_dialog_begin uses. */
+static cui_id dialog_move_id(cui_ctx *ui) { return cui_make_id(ui, "Move me") ^ 0xD1A106u; }
+
+/* Press at (x, y), travel to (x + dx, y + dy) in a few frames, release. */
+static void drag_by(cui_ctx *ui, build_fn fn, void *user, float x, float y, float dx, float dy) {
+    cui_input_mouse_move(ui, x, y);
+    run(ui, fn, user, 2);
+    cui_input_mouse_button(ui, CUI_MOUSE_LEFT, true);
+    run(ui, fn, user, 1);
+    for (int i = 1; i <= 4; i++) { cui_input_mouse_move(ui, x + dx * i / 4, y + dy * i / 4); run(ui, fn, user, 1); }
+    cui_input_mouse_button(ui, CUI_MOUSE_LEFT, false);
+    run(ui, fn, user, 2);
+}
+
+static void test_dialog_drag(void) {
+    printf("dialog: the header moves it, a plain dialog stays put\n");
+    cui_ctx *ui = new_ctx();
+    dlg_move_ctx d = { .open = true, .draggable = true };
+    run(ui, build_dialog_move, &d, 3);
+    cui_rect head = rect_of(ui, dialog_move_id(ui) ^ 0xD2A6u);
+    cui_rect b0 = rect_of(ui, d.button);
+    CHECK(head.w > 0);
+    /* grab the header's empty right side, left of the close button, and drag far outside the panel */
+    drag_by(ui, build_dialog_move, &d, head.x + 40, head.y + head.h / 2, 120, 80);
+    CHECK(d.open);                       /* letting go on the scrim is not a click on it */
+    cui_vec2 c = center(rect_of(ui, d.button));
+    click_at(ui, build_dialog_move, &d, c.x + 120, c.y + 80);
+    CHECK(d.inside == 1);                /* the button is under the pointer at its new place */
+    CHECK_NEAR(rect_of(ui, d.button).x, b0.x, 0.01);   /* layout stays centred; the move is a paint offset */
+    /* it cannot leave the window */
+    drag_by(ui, build_dialog_move, &d, head.x + 40 + 120, head.y + head.h / 2 + 80, 5000, 5000);
+    cui_rect pr = rect_of(ui, dialog_move_id(ui) ^ 0x9A4Eu);
+    c = center(rect_of(ui, d.button));
+    click_at(ui, build_dialog_move, &d, c.x + (800 - pr.w) / 2, c.y + (600 - pr.h) / 2);
+    CHECK(d.inside == 2);
+    /* closed and opened again it is centred */
+    d.open = false; run(ui, build_dialog_move, &d, 4);
+    d.open = true; run(ui, build_dialog_move, &d, 4);
+    c = center(rect_of(ui, d.button));
+    click_at(ui, build_dialog_move, &d, c.x, c.y);
+    CHECK(d.inside == 3);
+    /* not draggable: the same drag does nothing */
+    d.draggable = false;
+    drag_by(ui, build_dialog_move, &d, head.x + 40, head.y + head.h / 2, 120, 80);
+    click_at(ui, build_dialog_move, &d, c.x, c.y);
+    CHECK(d.inside == 4);
+    cui_destroy(ui);
+}
+
+static void test_dialog_resize(void) {
+    printf("dialog: the edges resize it, down to a minimum\n");
+    cui_ctx *ui = new_ctx();
+    dlg_move_ctx d = { .open = true, .resizable = true };
+    run(ui, build_dialog_move, &d, 3);
+    cui_id pid = dialog_move_id(ui) ^ 0x9A4Eu;
+    cui_rect p0 = rect_of(ui, pid);
+    CHECK_NEAR(p0.w, 440, 0.01);
+    /* right edge, 60 wider; the left edge stays where it was */
+    drag_by(ui, build_dialog_move, &d, p0.x + p0.w - 2, p0.y + p0.h / 2, 60, 0);
+    cui_rect p1 = rect_of(ui, pid);
+    CHECK(d.open);
+    CHECK_NEAR(p1.w, 500, 0.5);
+    /* bottom edge, 50 taller; the content keeps its place at the top */
+    float by0 = rect_of(ui, d.button).y;
+    drag_by(ui, build_dialog_move, &d, p1.x + p1.w / 2 + 30, p1.y + p1.h - 2, 0, 50);
+    cui_rect p2 = rect_of(ui, pid);
+    CHECK_NEAR(p2.h, p1.h + 50, 0.5);
+    CHECK_NEAR(rect_of(ui, d.button).y - p2.y, by0 - p1.y, 0.5);
+    /* the left edge (still where it began: a centred panel moves half of what it grows) shrinks it past the minimum; it stops there */
+    drag_by(ui, build_dialog_move, &d, p0.x + 2, p2.y + p2.h / 2 + 30, 2000, 0);
+    CHECK_NEAR(rect_of(ui, pid).w, 240, 0.5);
+    CHECK(d.open);
+    /* a button on the panel still works at the new size */
+    cui_vec2 c = center(rect_of(ui, d.button));
+    float shift = (p0.x + 500) - 240 / 2 - 400;   /* the right edge stayed, so the panel sits left of centre by this */
+    click_at(ui, build_dialog_move, &d, c.x + shift, c.y + 25);
+    CHECK(d.inside == 1);
+    /* without the option the edge is just the panel */
+    cui_destroy(ui);
+    ui = new_ctx();
+    d = (dlg_move_ctx){ .open = true };
+    run(ui, build_dialog_move, &d, 3);
+    p0 = rect_of(ui, dialog_move_id(ui) ^ 0x9A4Eu);
+    drag_by(ui, build_dialog_move, &d, p0.x + p0.w - 2, p0.y + p0.h / 2, 60, 0);
+    CHECK_NEAR(rect_of(ui, dialog_move_id(ui) ^ 0x9A4Eu).w, 440, 0.01);
+    cui_destroy(ui);
+}
+
+typedef struct { bool open; cui_id ok; } dlg_foot_ctx;
+static void build_dialog_foot(cui_ctx *ui, void *u) {
+    dlg_foot_ctx *d = u;
+    cui_dialog(ui, "Footer", &d->open, .resizable = true) {
+        cui_text(ui, "Body");
+        cui_dialog_footer(ui) { cui_button(ui, "OK"); d->ok = cui_last_id(ui); }
+    }
+}
+/** A dialog resized taller keeps its footer at the bottom, and a narrower window narrows it. */
+static void test_dialog_resize_footer_and_window(void) {
+    printf("dialog: the footer follows a resize, and the width follows a smaller window\n");
+    cui_ctx *ui = new_ctx();
+    dlg_foot_ctx d = { true, 0 };
+    run(ui, build_dialog_foot, &d, 3);
+    cui_id pid = (cui_make_id(ui, "Footer") ^ 0xD1A106u) ^ 0x9A4Eu;
+    cui_rect p0 = rect_of(ui, pid), b0 = rect_of(ui, d.ok);
+    float gap0 = (p0.y + p0.h) - (b0.y + b0.h);
+    drag_by(ui, build_dialog_foot, &d, p0.x + p0.w / 2 + 30, p0.y + p0.h - 2, 0, 80);
+    cui_rect p1 = rect_of(ui, pid), b1 = rect_of(ui, d.ok);
+    CHECK_NEAR(p1.h, p0.h + 80, 0.5);
+    CHECK_NEAR((p1.y + p1.h) - (b1.y + b1.h), gap0, 0.5);   /* the footer moved down with the bottom edge */
+    drag_by(ui, build_dialog_foot, &d, p1.x + p1.w - 2, p1.y + p1.h / 2, 200, 0);
+    CHECK_NEAR(rect_of(ui, pid).w, 640, 0.5);
+    cui_set_viewport(ui, 500, 600, 1);
+    run(ui, build_dialog_foot, &d, 3);
+    CHECK(rect_of(ui, pid).w <= 500 - 32 + 0.5f);              /* the stored width follows the window */
+    cui_destroy(ui);
+}
+
 typedef struct { int chosen; cui_id trigger; } menu_ctx;
 static void build_menu(cui_ctx *ui, void *u) {
     menu_ctx *m = u;
@@ -1716,6 +4168,10 @@ static void build_trap(cui_ctx *ui, void *u) {
     cui_dialog(ui, "Trap", &t->open) { if (cui_button(ui, "Inside")) t->inside++; }
 }
 
+static void build_trap_in_inactive_scope(cui_ctx *ui, void *u) {
+    cui_focus_scope(ui, 1, false) { build_trap(ui, u); }
+}
+
 static void test_focus_trap(void) {
     printf("overlays: tab focus stays inside a modal\n");
     cui_ctx *ui = new_ctx();
@@ -1730,13 +4186,82 @@ static void test_focus_trap(void) {
     CHECK(t.inside == 3);
     CHECK(t.open);
     cui_destroy(ui);
+
+    /* Modal layer filtering wins even when every pane is inactive. */
+    ui = new_ctx();
+    t = (trap_ctx){ true, 0, 0 };
+    run(ui, build_trap_in_inactive_scope, &t, 3);
+    key(ui, build_trap_in_inactive_scope, &t, CUI_KEY_TAB, 0);
+    key(ui, build_trap_in_inactive_scope, &t, CUI_KEY_TAB, 0);
+    key(ui, build_trap_in_inactive_scope, &t, CUI_KEY_ENTER, 0);
+    CHECK(t.inside == 1 && t.under == 0 && t.open);
+    cui_destroy(ui);
 }
 
-typedef struct { char tags[128]; char otp[8]; int otp_done; int held; cui_id tag_id, otp_id, hold_id; } extras_ctx;
+typedef enum {
+    POPUP_FOCUS_NONE, POPUP_FOCUS_DIALOG, POPUP_FOCUS_PARENT,
+    POPUP_FOCUS_CHILD, POPUP_FOCUS_OUTSIDE
+} popup_focus_stop;
+typedef struct {
+    bool dialog_open, open_popovers, close_parent;
+    popup_focus_stop activated;
+} popup_focus_ctx;
+
+static void build_popup_focus_trap(cui_ctx *ui, void *user) {
+    popup_focus_ctx *t = user;
+    if (cui_button(ui, "Page")) t->activated = POPUP_FOCUS_OUTSIDE;
+    if (t->open_popovers) cui_popover_open(ui, "Page popover");
+    cui_popover(ui, "Page popover") {
+        if (cui_button(ui, "Outside modal")) t->activated = POPUP_FOCUS_OUTSIDE;
+    }
+    cui_dialog(ui, "Dialog", &t->dialog_open, .persistent = true, .no_close_button = true) {
+        if (cui_button(ui, "Dialog button")) t->activated = POPUP_FOCUS_DIALOG;
+        if (t->open_popovers) cui_popover_open(ui, "Parent popover");
+        if (t->close_parent) cui_popover_close(ui, "Parent popover");
+        cui_popover(ui, "Parent popover") {
+            if (cui_button(ui, "Parent button")) t->activated = POPUP_FOCUS_PARENT;
+            if (t->open_popovers) cui_popover_open(ui, "Child popover");
+            cui_popover(ui, "Child popover") {
+                if (cui_button(ui, "Child button")) t->activated = POPUP_FOCUS_CHILD;
+            }
+        }
+    }
+    t->open_popovers = false;
+}
+
+static void check_popup_focus(cui_ctx *ui, popup_focus_ctx *t, int mods, popup_focus_stop expected) {
+    key(ui, build_popup_focus_trap, t, CUI_KEY_TAB, mods);
+    t->activated = POPUP_FOCUS_NONE;
+    key(ui, build_popup_focus_trap, t, CUI_KEY_ENTER, 0);
+    CHECK(t->activated == expected);
+}
+
+static void test_modal_popup_focus_trap(void) {
+    printf("overlays: Tab reaches nested popovers inside the active modal\n");
+    cui_ctx *ui = new_ctx();
+    popup_focus_ctx t = { .dialog_open = true, .open_popovers = true };
+    run(ui, build_popup_focus_trap, &t, 1);
+
+    check_popup_focus(ui, &t, 0, POPUP_FOCUS_DIALOG);
+    check_popup_focus(ui, &t, 0, POPUP_FOCUS_PARENT);
+    check_popup_focus(ui, &t, 0, POPUP_FOCUS_CHILD);
+    check_popup_focus(ui, &t, 0, POPUP_FOCUS_DIALOG);
+    check_popup_focus(ui, &t, CUI_MOD_SHIFT, POPUP_FOCUS_CHILD);
+    check_popup_focus(ui, &t, CUI_MOD_SHIFT, POPUP_FOCUS_PARENT);
+
+    t.close_parent = true;
+    run(ui, build_popup_focus_trap, &t, 1);
+    check_popup_focus(ui, &t, 0, POPUP_FOCUS_DIALOG);
+    cui_destroy(ui);
+}
+
+typedef struct { char tags[128]; char otp[8]; int max_tags, otp_done, held; cui_id tag_id, otp_id, hold_id; } extras_ctx;
+
+/** Use the same controls for ordinary editing and batched input. */
 static void build_extras(cui_ctx *ui, void *u) {
     extras_ctx *x = u;
     cui_column(ui, .pad = 20, .gap = 16, .width = CUI_PX(500)) {
-        cui_tag_input(ui, "tags", x->tags, sizeof x->tags);
+        cui_tag_input(ui, "tags", x->tags, sizeof x->tags, .max_tags = x->max_tags);
         x->tag_id = cui_last_id(ui);
         if (cui_otp_input(ui, "otp", x->otp, 4)) x->otp_done++;
         x->otp_id = cui_last_id(ui);
@@ -1745,6 +4270,70 @@ static void build_extras(cui_ctx *ui, void *u) {
     }
 }
 
+static void advance_toast(cui_ctx *ui, float elapsed) {
+    cui_begin_frame(ui, elapsed);
+    cui_end_frame(ui);
+}
+
+/** Timed toasts expire after an idle wake and stop accepting input on exit. */
+static void test_toast_deadline(void) {
+    printf("toast: idle deadline and expired action\n");
+    cui_ctx *ui = new_ctx();
+    cui_input_mouse_leave(ui);
+    cui_begin_frame(ui, 0);
+    cui_toast(ui, "Idle notice", .duration = 1.2f);
+    cui_end_frame(ui);
+    float wake = cui_next_wakeup(ui);
+    CHECK(wake >= 1.2f && wake < 1.3f);
+    advance_toast(ui, wake);
+    CHECK(cui_next_wakeup(ui) < 0);
+    cui_destroy(ui);
+
+    ui = new_ctx();
+    cui_begin_frame(ui, 0);
+    cui_toast(ui, "Pause on hover", .duration = 1.2f);
+    cui_end_frame(ui);
+    cui_input_mouse_move(ui, 700, 550);
+    advance_toast(ui, 0.1f);
+    advance_toast(ui, 2.0f);
+    CHECK(cui_next_wakeup(ui) < 0);
+    cui_input_mouse_leave(ui);
+    advance_toast(ui, 0);
+    wake = cui_next_wakeup(ui);
+    CHECK(wake > 1.0f && wake < 1.3f);
+    cui_destroy(ui);
+
+    ui = new_ctx();
+    cui_input_mouse_leave(ui);
+    cui_set_reduced_motion(ui, false);
+    cui_begin_frame(ui, 0);
+    int handle = cui_toast(ui, "Message archived", .duration = 1.0f, .action = "Undo");
+    cui_end_frame(ui);
+    cui_input_key(ui, CUI_KEY_TAB, true, 0);
+    cui_input_key(ui, CUI_KEY_TAB, false, 0);
+    advance_toast(ui, 0.01f);
+    for (int i = 0; i < 49; i++) advance_toast(ui, 0.02f);
+    cui_input_key(ui, CUI_KEY_ENTER, true, 0);
+    cui_input_key(ui, CUI_KEY_ENTER, false, 0);
+    advance_toast(ui, 0.02f);
+    CHECK(!cui_toast_action_clicked(ui, handle));
+    cui_destroy(ui);
+}
+
+/** One input event can fill the last slot but cannot create another tag. */
+static void test_tag_limit_batch(void) {
+    printf("tag input: enforce capacity for each separator\n");
+    cui_ctx *ui = new_ctx();
+    extras_ctx x = { .max_tags = 1 };
+    run(ui, build_extras, &x, 2);
+    key(ui, build_extras, &x, CUI_KEY_TAB, 0);
+    type(ui, build_extras, &x, "one,two,");
+    if (strcmp(x.tags, "one") != 0) printf("  Tags after one input event: %s\n", x.tags);
+    CHECK(strcmp(x.tags, "one") == 0);
+    cui_destroy(ui);
+}
+
+/** Ordinary editing, replacement of complete codes, and held activation. */
 static void test_extras(void) {
     printf("extras: tag input, one time code, hold to confirm\n");
     cui_ctx *ui = new_ctx();
@@ -1776,6 +4365,13 @@ static void test_extras(void) {
     snprintf(g_clip, sizeof g_clip, " 7-7-7-7 ");
     key(ui, build_extras, &x, CUI_KEY_V, CUI_MOD_PRIMARY);
     CHECK(strcmp(x.otp, "7777") == 0 && x.otp_done == 2);
+    snprintf(g_clip, sizeof g_clip, "8B9C");
+    key(ui, build_extras, &x, CUI_KEY_V, CUI_MOD_PRIMARY);
+    CHECK(strcmp(x.otp, "8B9C") == 0);
+    if (x.otp_done != 3) printf("  Completion count after replacing a complete code: %d\n", x.otp_done);
+    CHECK(x.otp_done == 3);
+    key(ui, build_extras, &x, CUI_KEY_V, CUI_MOD_PRIMARY);
+    CHECK(x.otp_done == 3);
     /* hold: a short press does nothing, a long one fires once */
     cui_vec2 hc = center(rect_of(ui, x.hold_id));
     click_at(ui, build_extras, &x, hc.x, hc.y);
@@ -1836,6 +4432,37 @@ static void test_reorder(void) {
     cui_input_mouse_move(ui, 150, 190);
     run(ui, build_reorder, &r2, 5);
     CHECK(r2.changed == 0 && r2.order[0] == 0 && r2.order[3] == 3);
+    cui_destroy(ui);
+}
+
+/* a press on a row the list no longer has must not start a drag: the drag used
+ * slot geometry this frame never measured, and a later frame could commit it */
+typedef struct { int order[4]; int count; int changed; } reorder_n_ctx;
+static void build_reorder_n(cui_ctx *ui, void *u) {
+    reorder_n_ctx *r = u;
+    cui_column(ui, .pad = 20, .width = CUI_PX(300)) {
+        cui_reorder_begin(ui, "list", r->order, r->count);
+        for (int i = 0; i < r->count; i++) cui_reorder_item(ui, i) { cui_textf(ui, "Item %d", r->order[i]); }
+        if (cui_reorder_end(ui)) r->changed++;
+    }
+}
+static void test_reorder_shrink(void) {
+    printf("data: a reorder list that shrinks under a press starts no drag\n");
+    cui_ctx *ui = new_ctx();
+    reorder_n_ctx r = { { 0, 1, 2, 3 }, 4, 0 };
+    run(ui, build_reorder_n, &r, 3);
+    cui_input_mouse_move(ui, 150, 160);   /* the last row */
+    run(ui, build_reorder_n, &r, 1);
+    cui_input_mouse_button(ui, CUI_MOUSE_LEFT, true);
+    run(ui, build_reorder_n, &r, 1);
+    r.count = 2;                          /* the pressed row is gone */
+    cui_input_mouse_move(ui, 150, 170);
+    run(ui, build_reorder_n, &r, 1);
+    r.count = 4;
+    cui_input_mouse_button(ui, CUI_MOUSE_LEFT, false);
+    run(ui, build_reorder_n, &r, 3);
+    CHECK(r.changed == 0);
+    CHECK(r.order[0] == 0 && r.order[1] == 1 && r.order[2] == 2 && r.order[3] == 3);
     cui_destroy(ui);
 }
 
@@ -2532,21 +5159,54 @@ static void test_dock(void) {
     cui_destroy(ui);
 }
 
+typedef struct { float width, ratio; } split_range_case;
+
+/** A horizontal split containing two measurable panes. */
+static void build_split_range(cui_ctx *ui, void *user) {
+    split_range_case *split = user;
+    cui_split(ui, "short split", &split->ratio, .width = CUI_PX(split->width), .height = CUI_PX(120)) {
+        cui_box(ui, .id = "first pane", .width = CUI_FILL, .height = CUI_FILL) {}
+        cui_split_next(ui);
+        cui_box(ui, .id = "second pane", .width = CUI_FILL, .height = CUI_FILL) {}
+    }
+}
+
+/** An undersized split fits both panes and reports a bounded drag ratio. */
+static void test_split_minimums(void) {
+    printf("split view: pane minimums at small widths\n");
+    cui_ctx *ui = new_ctx();
+    split_range_case split = { 100, 0.5f };
+    run(ui, build_split_range, &split, 4);
+    cui_rect first = rect_of(ui, cui_make_id(ui, "first pane"));
+    cui_rect second = rect_of(ui, cui_make_id(ui, "second pane"));
+    CHECK(first.w + second.w <= split.width);
+    drag(ui, build_split_range, &split, first.x + first.w, first.y + 50, 20, 4);
+    CHECK(split.ratio >= 0 && split.ratio <= 1);
+    split.width = 380;
+    run(ui, build_split_range, &split, 4);
+    first = rect_of(ui, cui_make_id(ui, "first pane"));
+    drag(ui, build_split_range, &split, first.x + first.w, first.y + 50, 245, 4);
+    CHECK(split.ratio > 0.6f && split.ratio < 0.7f);
+    cui_destroy(ui);
+}
+
 /* virtual list ---------------------------------------------------------- */
 
-typedef struct { int first, last, built; } vl_ctx;
+typedef struct { int first, last, built, count; } vl_ctx;
+/** Build only the range returned by the virtual list for the current row count. */
 static void build_vlist(cui_ctx *ui, void *u) {
     vl_ctx *v = u;
     v->built = 0;
-    cui_virtual_list(ui, "vl", 100000, 20, CUI_PX(200), &v->first, &v->last) {
+    cui_virtual_list(ui, "vl", v->count, 20, CUI_PX(200), &v->first, &v->last) {
         for (int i = v->first; i < v->last; i++) { cui_row(ui, .height = CUI_PX(20)) { cui_textf(ui, "Row %d", i); } v->built++; }
     }
 }
 
+/** Verify the visible range after scrolling and immediately after removing rows. */
 static void test_virtual_list(void) {
     printf("data: virtual list builds only visible rows\n");
     cui_ctx *ui = new_ctx();
-    vl_ctx v = { 0, 0, 0 };
+    vl_ctx v = { .count = 100000 };
     run(ui, build_vlist, &v, 3);
     CHECK(v.first == 0);
     CHECK(v.built > 5 && v.built < 30);
@@ -2556,6 +5216,12 @@ static void test_virtual_list(void) {
     run(ui, build_vlist, &v, 5);
     CHECK(v.first > 300);
     CHECK(v.built < 30);
+    v.count = 1;
+    run(ui, build_vlist, &v, 1);
+    CHECK(v.first == 0 && v.last == 1 && v.built == 1);
+    v.count = 0;
+    run(ui, build_vlist, &v, 1);
+    CHECK(v.first == 0 && v.last == 0 && v.built == 0);
     cui_destroy(ui);
 }
 
@@ -2587,6 +5253,195 @@ static void test_theme(void) {
     run(ui, build_empty, NULL, 5);
     CHECK(!cui_needs_redraw(ui));
     cui_destroy(ui);
+}
+
+/* the series palette: every color readable on the page, at one lightness, under every accent */
+static double series_lin(int c) { double v = c / 255.0; return v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4); }
+static double series_lum(cui_color c) { return 0.2126 * series_lin(c.r) + 0.7152 * series_lin(c.g) + 0.0722 * series_lin(c.b); }
+static double series_oklab_l(cui_color c) {
+    double r = series_lin(c.r), g = series_lin(c.g), b = series_lin(c.b);
+    double l = cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b);
+    double m = cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b);
+    double s = cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b);
+    return 0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s;
+}
+
+static void test_series_palette(void) {
+    printf("theme: the series palette is even and readable in both modes\n");
+    for (int dark = 0; dark < 2; dark++)
+        for (int a = 0; a < CUI_ACCENT_COUNT; a++) {
+            cui_ctx *ui = cui_create(&(cui_ctx_desc){ .renderer = cui_sw_iface(g_sw), .theme = dark ? CUI_THEME_DARK : CUI_THEME_LIGHT, .accent = (cui_accent)a });
+            cui_color bg = cui_token_color(ui, CUI_TOKEN_SURFACE);
+            double lo = 1, hi = 0, worst = 99;
+            for (int k = 0; k < 6; k++) {
+                cui_color c = cui_token_color(ui, (cui_token)(CUI_TOKEN_SERIES_1 + k));
+                double L = series_oklab_l(c), y1 = series_lum(c), y2 = series_lum(bg);
+                double cr = (fmax(y1, y2) + 0.05) / (fmin(y1, y2) + 0.05);
+                lo = fmin(lo, L); hi = fmax(hi, L); worst = fmin(worst, cr);
+            }
+            CHECK(hi - lo < 0.02);   /* one lightness: no series louder than another */
+            CHECK(worst >= 3.0);     /* graphics contrast on a card */
+            cui_destroy(ui);
+        }
+}
+
+/* radial gauge styles: AUTO picks segments with bands and the arc without; each style is
+ * told apart by its pixels: segments break up along the arc, the arc is one stroke with a
+ * gap at the bottom, the ring closes there */
+typedef struct { cui_gauge_style style; bool bands; } gauge_case;
+static void build_gauge_case(cui_ctx *ui, void *u) {
+    const gauge_case *g = u;
+    static const cui_gauge_band b[] = { { 50, CUI_TONE_SUCCESS, "Ok" }, { 100, CUI_TONE_DANGER, "Hot" } };
+    cui_radial_gauge(ui, "g", 80, 0, 100, .size = 200, .style = g->style, .bands = g->bands ? b : NULL, .band_count = g->bands ? 2 : 0);
+}
+static bool gauge_ink(const unsigned char *px, int w, float x, float y, const unsigned char *bg) {
+    const unsigned char *q = px + ((int)y * w + (int)x) * 4;
+    return abs(q[0] - bg[0]) + abs(q[1] - bg[1]) + abs(q[2] - bg[2]) > 12;
+}
+/* breaks: ink and gap changes along the lit part of the arc; *bottom: ink under the middle */
+static void gauge_probe(gauge_case g, int *breaks, bool *bottom) {
+    cui_ctx *ui = cui_create(&(cui_ctx_desc){ .renderer = cui_sw_iface(g_sw) });
+    cui_set_viewport(ui, 240, 280, 1);
+    run(ui, build_gauge_case, &g, 90);
+    cui_rect r = cui_get_rect(ui, cui_make_id(ui, "g"));
+    const cui_draw_data *dd = cui_get_draw_data(ui);
+    unsigned char *px = calloc((size_t)dd->width_px * dd->height_px, 4);
+    cui_sw_render(g_sw, dd, px, dd->width_px, dd->height_px, dd->width_px * 4, CUI_SW_RGBA);
+    unsigned char bg[3] = { px[(dd->height_px - 2) * dd->width_px * 4], px[(dd->height_px - 2) * dd->width_px * 4 + 1], px[(dd->height_px - 2) * dd->width_px * 4 + 2] };
+    float R = 96, cx = r.x + r.w * 0.5f, cy = r.y + 4 + R, a0 = 3.14159265f * 0.75f, sweep = 3.14159265f * 1.5f;
+    int changes = 0;
+    bool prev = false;
+    for (int i = 0; i <= 400; i++) {
+        float a = a0 + sweep * (0.05f + 0.7f * (float)i / 400.0f);
+        bool ink = gauge_ink(px, dd->width_px, cx + cosf(a) * 84, cy + sinf(a) * 84, bg);
+        if (i > 0 && ink != prev) changes++;
+        prev = ink;
+    }
+    *breaks = changes;
+    *bottom = gauge_ink(px, dd->width_px, cx, cy + 90, bg);
+    free(px);
+    cui_destroy(ui);
+}
+
+static void test_radial_gauge_styles(void) {
+    printf("radial gauge: the style follows the options\n");
+    int breaks; bool bottom;
+    gauge_probe((gauge_case){ CUI_GAUGE_AUTO, false }, &breaks, &bottom);
+    CHECK(breaks == 0 && !bottom);              /* no bands: the arc */
+    gauge_probe((gauge_case){ CUI_GAUGE_AUTO, true }, &breaks, &bottom);
+    CHECK(breaks >= 10 && !bottom);             /* bands: the segments */
+    gauge_probe((gauge_case){ CUI_GAUGE_SEGMENTS, false }, &breaks, &bottom);
+    CHECK(breaks >= 10);
+    gauge_probe((gauge_case){ CUI_GAUGE_ARC, true }, &breaks, &bottom);
+    CHECK(breaks == 0 && !bottom);              /* asked for the arc, bands only color it */
+    gauge_probe((gauge_case){ CUI_GAUGE_RING, false }, &breaks, &bottom);
+    CHECK(breaks == 0 && bottom);               /* the ring closes under the value */
+}
+
+/* treemap selection: a click selects a tile, a second click on it clears, NULL keeps none */
+static int g_tm_pick = -1;
+static void build_tm_select(cui_ctx *ui, void *u) {
+    (void)u;
+    static const cui_viz_item items[] = { { "Big", 3, { 0 } }, { "Small", 1, { 0 } } };
+    cui_treemap(ui, "pick", items, 2, .width = CUI_PX(400), .height = 200, .selected = &g_tm_pick);
+}
+static void test_treemap_select(void) {
+    printf("treemap: a click selects a tile and a second click clears it\n");
+    cui_ctx *ui = cui_create(&(cui_ctx_desc){ .renderer = cui_sw_iface(g_sw) });
+    cui_set_viewport(ui, 420, 220, 1);
+    run(ui, build_tm_select, NULL, 3);
+    cui_rect r = cui_get_rect(ui, cui_make_id(ui, "pick"));
+    click_at(ui, build_tm_select, NULL, r.x + 60, r.y + 100);    /* the big tile fills the left three quarters */
+    CHECK(g_tm_pick == 0);
+    click_at(ui, build_tm_select, NULL, r.x + 360, r.y + 100);
+    CHECK(g_tm_pick == 1);
+    click_at(ui, build_tm_select, NULL, r.x + 360, r.y + 100);
+    CHECK(g_tm_pick == -1);
+    cui_destroy(ui);
+}
+
+/* sankey node colors: a node takes the caller's color; one left unset falls back */
+static void build_sankey_colors(cui_ctx *ui, void *u) {
+    (void)u;
+    static const char *nodes[] = { "A", "B" };
+    static const cui_sankey_link links[] = { { 0, 1, 10 } };
+    const cui_color colors[] = { CUI_RGB(0xff0000), { 0 } };
+    cui_sankey(ui, "sk", nodes, 2, links, 1, .width = CUI_PX(300), .height = 120, .node_colors = colors);
+}
+/** Draw a single visible link after an omitted zero-value link. */
+static void build_sankey_click(cui_ctx *ui, void *user) {
+    int *clicked = user;
+    static const char *const nodes[] = { "Source", "Target" };
+    static const cui_sankey_link links[] = { { 0, 1, 0 }, { 0, 1, 10 } };
+    *clicked = cui_sankey(ui, "click flow", nodes, 2, links, 2, .width = CUI_PX(300), .height = 120);
+}
+
+/** A ribbon click reports its original link index after the node indexes. */
+static void test_sankey_link_click(void) {
+    printf("sankey: a ribbon click identifies its input link\n");
+    cui_ctx *ui = new_ctx();
+    int clicked = -1;
+    run(ui, build_sankey_click, &clicked, 3);
+    cui_rect chart = rect_of(ui, cui_make_id(ui, "click flow"));
+    click_at(ui, build_sankey_click, &clicked, chart.x + 2, chart.y + chart.h / 2);
+    CHECK(clicked == 0);
+    click_at(ui, build_sankey_click, &clicked, chart.x + chart.w / 2, chart.y + chart.h / 2);
+    CHECK(clicked == 3);
+    run(ui, build_sankey_click, &clicked, 1);
+    CHECK(clicked == -1);
+    cui_destroy(ui);
+}
+
+static void test_sankey_node_colors(void) {
+    printf("sankey: nodes take the caller's colors\n");
+    cui_ctx *ui = cui_create(&(cui_ctx_desc){ .renderer = cui_sw_iface(g_sw) });
+    cui_set_viewport(ui, 320, 140, 1);
+    run(ui, build_sankey_colors, NULL, 60);
+    cui_rect r = cui_get_rect(ui, cui_make_id(ui, "sk"));
+    const cui_draw_data *dd = cui_get_draw_data(ui);
+    unsigned char *px = calloc((size_t)dd->width_px * dd->height_px, 4);
+    cui_sw_render(g_sw, dd, px, dd->width_px, dd->height_px, dd->width_px * 4, CUI_SW_RGBA);
+    const unsigned char *a = px + ((int)(r.y + r.h * 0.5f) * dd->width_px + (int)(r.x + 3)) * 4;
+    CHECK(a[0] > 240 && a[1] < 20 && a[2] < 20);                  /* the source node in red */
+    CHECK(!(a[0] == a[1] && a[1] == a[2]));
+    free(px);
+    cui_destroy(ui);
+}
+
+/* gantt state: a bar takes its state's color; AUTO reads it from progress and today */
+static cui_gantt_task g_gantt_case;
+static void build_gantt_case(cui_ctx *ui, void *u) {
+    (void)u;
+    cui_date org = { 2026, 11, 2 };
+    cui_gantt(ui, "gs", &g_gantt_case, 1, org, 10, .day_width = 30, .today = 2, .read_only = true);
+}
+static void gantt_bar_px(cui_gantt_task t, unsigned char out[3]) {
+    g_gantt_case = t;
+    cui_ctx *ui = cui_create(&(cui_ctx_desc){ .renderer = cui_sw_iface(g_sw) });
+    cui_set_viewport(ui, 620, 160, 1);
+    run(ui, build_gantt_case, NULL, 10);
+    cui_rect b = cui_get_rect(ui, cui_make_id(ui, "gs") ^ 0xB0D7u);
+    const cui_draw_data *dd = cui_get_draw_data(ui);
+    unsigned char *px = calloc((size_t)dd->width_px * dd->height_px, 4);
+    cui_sw_render(g_sw, dd, px, dd->width_px, dd->height_px, dd->width_px * 4, CUI_SW_RGBA);
+    const unsigned char *q = px + ((int)(b.y + 20) * dd->width_px + (int)(b.x + t.start * 30 + (t.end - t.start) * 30 * 0.8f)) * 4;
+    memcpy(out, q, 3);
+    free(px);
+    cui_destroy(ui);
+}
+static void test_gantt_state(void) {
+    printf("gantt: bars take the color of their state\n");
+    unsigned char done[3], planned[3], auto_done[3], auto_planned[3], auto_active[3];
+    gantt_bar_px((cui_gantt_task){ "", NULL, 4, 8, 0, 0, -1, false, CUI_GANTT_DONE }, done);
+    gantt_bar_px((cui_gantt_task){ "", NULL, 4, 8, 0, 0, -1, false, CUI_GANTT_PLANNED }, planned);
+    gantt_bar_px((cui_gantt_task){ "", NULL, 4, 8, 1, 0, -1, false, CUI_GANTT_AUTO }, auto_done);
+    gantt_bar_px((cui_gantt_task){ "", NULL, 4, 8, 0, 0, -1, false, CUI_GANTT_AUTO }, auto_planned);   /* starts after today */
+    gantt_bar_px((cui_gantt_task){ "", NULL, 1, 8, 0, 0, -1, false, CUI_GANTT_AUTO }, auto_active);    /* started, nothing done */
+    CHECK(done[1] > done[0] + 20 && done[1] > done[2]);                     /* a filled green bar */
+    CHECK(abs(planned[0] - planned[1]) < 6 && abs(planned[1] - planned[2]) < 6 && planned[0] > 200);   /* a light gray tint */
+    CHECK(memcmp(done, auto_done, 3) == 0);
+    CHECK(memcmp(planned, auto_planned, 3) == 0);
+    CHECK(auto_active[2] > auto_active[0]);                                 /* the first series color, blue */
 }
 
 /* draw data and renderer ------------------------------------------------ */
@@ -2697,6 +5552,27 @@ static void build_roll(cui_ctx *ui, void *user) {
     roll_ctx *r = user;
     cui_row(ui) { cui_number_roll(ui, "n", r->v, .size = 20); }
 }
+/** Render the same long number as an animated label and as plain tabular text. */
+static void build_number_roll_reference(cui_ctx *ui, void *user) {
+    const char *text = user;
+    cui_row(ui) { cui_text(ui, text, .size = 20, .tabular = true, .nowrap = true); }
+}
+
+/** Over-capacity text keeps every digit and every affix. */
+static void test_long_number_roll(void) {
+    printf("rolling number: complete long numbers and affixes\n");
+    static const char *const values[] = { "1234567890123456789012345", "1 milliseconds per request" };
+    for (int k = 0; k < 2; k++) {
+        cui_ctx *ui = new_ctx(), *reference = new_ctx();
+        roll_ctx r = { values[k] };
+        run(ui, build_roll, &r, 2);
+        run(reference, build_number_roll_reference, (void *)values[k], 2);
+        CHECK(cui_get_draw_data(ui)->vertex_count == cui_get_draw_data(reference)->vertex_count);
+        cui_destroy(reference);
+        cui_destroy(ui);
+    }
+}
+
 static void test_number_roll(void) {
     printf("motion: a rolling number settles on its text, keeps a fixed prefix and fits its width\n");
     cui_ctx *ui = new_ctx();
@@ -2721,6 +5597,35 @@ static void test_number_roll(void) {
     run(ui, build_roll, &r, 2);
     CHECK(!cui_needs_redraw(ui));
     cui_destroy(ui);
+}
+
+/** Drive the hover with explicit frame intervals so the wake can be tested. */
+static int paint_hover_tooltip(cui_ctx *ui, float elapsed, bool show_hint) {
+    cui_begin_frame(ui, elapsed);
+    cui_button(ui, "Anchor");
+    if (show_hint) cui_tooltip(ui, "Tooltip");
+    cui_end_frame(ui);
+    return cui_get_draw_data(ui)->vertex_count;
+}
+
+/** A cold hover waits for its deadline and appears on the requested wake. */
+static void test_tooltip_hover_delay(void) {
+    printf("tooltip: cold hover and idle wake\n");
+    for (int idle = 0; idle < 2; idle++) {
+        cui_ctx *ui = new_ctx();
+        cui_input_mouse_leave(ui);
+        if (idle) paint_hover_tooltip(ui, 0.25f, true);
+        paint_hover_tooltip(ui, idle ? 0.25f : 0.01f, true);
+        cui_vec2 pos = center(cui_last_rect(ui));
+        cui_input_mouse_move(ui, pos.x, pos.y);
+        int without_hint = paint_hover_tooltip(ui, 0.01f, false);
+        int hovered = paint_hover_tooltip(ui, 0, true);
+        CHECK(hovered == without_hint);
+        float wake = cui_next_wakeup(ui);
+        CHECK(wake > 0.5f && wake < 0.6f);
+        if (wake > 0) CHECK(paint_hover_tooltip(ui, wake, true) > hovered);
+        cui_destroy(ui);
+    }
 }
 
 static void test_truncated_tooltip(void) {
@@ -2980,6 +5885,38 @@ static void drag_to(cui_ctx *ui, nodes_ctx *a, cui_vec2 from, cui_vec2 to) {
     }
     cui_input_mouse_button(ui, CUI_MOUSE_LEFT, false);
     run(ui, build_nodes, a, 2);
+}
+
+typedef struct { bool disabled; cui_node_view view; cui_id id; } node_wheel_case;
+
+/** Build an empty node editor that can be disabled without changing its ID. */
+static void build_node_wheel(cui_ctx *ui, void *user) {
+    node_wheel_case *n = user;
+    cui_push_disabled(ui, n->disabled);
+    n->id = cui_make_id(ui, "graph");
+    if (cui_node_editor_begin(ui, "graph", &n->view, .height = CUI_PX(240))) cui_node_editor_end(ui);
+    cui_pop_disabled(ui);
+}
+
+/** A queued wheel event cannot zoom the editor after its scope is disabled. */
+static void test_disabled_node_editor_wheel(void) {
+    printf("node editor: disabled wheel leaves zoom and offset unchanged\n");
+    cui_ctx *ui = new_ctx();
+    node_wheel_case n = { .view = { .zoom = 1 } };
+    run(ui, build_node_wheel, &n, 3);
+    cui_vec2 at = center(rect_of(ui, n.id));
+    cui_input_mouse_move(ui, at.x, at.y);
+    run(ui, build_node_wheel, &n, 1);
+    n.disabled = true;
+    cui_input_scroll(ui, 0, 2);
+    run(ui, build_node_wheel, &n, 1);
+    CHECK(n.view.zoom == 1 && n.view.x == 0 && n.view.y == 0);
+    n.disabled = false;
+    run(ui, build_node_wheel, &n, 2);
+    cui_input_scroll(ui, 0, 2);
+    run(ui, build_node_wheel, &n, 1);
+    CHECK(n.view.zoom > 1);
+    cui_destroy(ui);
 }
 
 static void test_node_editor(void) {
@@ -3517,6 +6454,33 @@ static int tl_selected(const tl_ctx *a) {
 static void tl_mods(cui_ctx *ui, int mods) { cui_input_key(ui, CUI_KEY_NONE, mods != 0, mods); }
 static unsigned tl_rand(unsigned *s) { *s ^= *s << 13; *s ^= *s >> 17; *s ^= *s << 5; return *s; }
 
+/** Draw the timeline inside a disabled scope. */
+static void build_disabled_timeline(cui_ctx *ui, void *user) {
+    cui_push_disabled(ui, true);
+    build_tl(ui, user);
+    cui_pop_disabled(ui);
+}
+
+/** A wheel event queued before disabling the timeline cannot change its view. */
+static void test_disabled_timeline_wheel(void) {
+    printf("timeline: disabled wheel leaves the view unchanged\n");
+    cui_ctx *ui = new_ctx();
+    tl_ctx a;
+    tl_setup(&a);
+    run(ui, build_tl, &a, 3);
+    tl_map m = tl_map_of(ui, &a);
+    cui_input_mouse_move(ui, m.px + m.pw / 2, m.ry + 14);
+    run(ui, build_tl, &a, 1);
+    cui_input_scroll(ui, 0, 2);
+    run(ui, build_disabled_timeline, &a, 1);
+    CHECK(a.view.start == 0 && a.view.end == 4 && !a.r.view_changed);
+    run(ui, build_tl, &a, 2);
+    cui_input_scroll(ui, 0, 2);
+    run(ui, build_tl, &a, 1);
+    CHECK(a.view.end - a.view.start < 4);
+    cui_destroy(ui);
+}
+
 static void test_timeline(void) {
     printf("timeline editor: scrub, frame keys, select, box select, snapped drags, add, delete, zoom, fit, groups, clips, 2000 tracks, empty\n");
     cui_ctx *ui = new_ctx();
@@ -3881,6 +6845,171 @@ static void test_timeline(void) {
     cui_destroy(ui);
 }
 
+typedef struct { cui_cal_event event; cui_gantt_task task; bool gantt; int activated; } read_only_plan;
+
+/** Build a single item so Tab has one unambiguous target. */
+static void build_read_only_plan(cui_ctx *ui, void *user) {
+    read_only_plan *plan = user;
+    const cui_date origin = { 2026, 3, 2 };
+    if (plan->gantt)
+        plan->activated = cui_gantt(ui, "gantt", &plan->task, 1, origin, 14, .read_only = true);
+    else
+        plan->activated = cui_week_calendar(ui, "week", origin, &plan->event, 1,
+                                           .start_hour = 8, .end_hour = 16, .read_only = true);
+}
+
+/** Read-only tasks and events can activate without editing dates. */
+static void test_read_only_plan_activation(void) {
+    printf("planning: read-only activation without editing\n");
+    for (int gantt = 0; gantt < 2; gantt++) {
+        cui_ctx *ui = new_ctx();
+        read_only_plan plan = { .event = { .title = "Review", .day = 1, .start = 10, .end = 11 },
+                               .task = { .name = "Review", .start = 2, .end = 4, .depends_on = -1 },
+                               .gantt = gantt != 0 };
+        cui_input_mouse_leave(ui);
+        run(ui, build_read_only_plan, &plan, 3);
+        key(ui, build_read_only_plan, &plan, CUI_KEY_TAB, 0);
+        key(ui, build_read_only_plan, &plan, CUI_KEY_RIGHT, 0);
+        CHECK(plan.event.day == 1 && plan.task.start == 2 && plan.task.end == 4);
+        key(ui, build_read_only_plan, &plan, CUI_KEY_ENTER, 0);
+        CHECK(plan.activated == 0);
+        key(ui, build_read_only_plan, &plan, CUI_KEY_SPACE, 0);
+        CHECK(plan.activated == 0);
+        if (!gantt) {
+            cui_rect week = rect_of(ui, cui_make_id(ui, "week"));
+            float x = week.x + 60 + 1.5f * (week.w - 60) / 7;
+            float y = week.y + 57 + 2.5f * 52;
+            click_at(ui, build_read_only_plan, &plan, x, y);
+            CHECK(plan.activated == 0);
+
+            /* The pointer moves beyond the drag threshold in the release frame. */
+            cui_input_mouse_button(ui, CUI_MOUSE_LEFT, true);
+            run(ui, build_read_only_plan, &plan, 1);
+            cui_input_mouse_move(ui, x + 12, y);
+            cui_input_mouse_button(ui, CUI_MOUSE_LEFT, false);
+            run(ui, build_read_only_plan, &plan, 1);
+            CHECK(plan.activated == -1);
+            CHECK(plan.event.day == 1 && plan.event.start == 10 && plan.event.end == 11);
+
+            /* The pointer moves on after the release, before the frame: still a click. */
+            cui_input_mouse_move(ui, x, y);
+            run(ui, build_read_only_plan, &plan, 1);
+            cui_input_mouse_button(ui, CUI_MOUSE_LEFT, true);
+            run(ui, build_read_only_plan, &plan, 1);
+            cui_input_mouse_button(ui, CUI_MOUSE_LEFT, false);
+            cui_input_mouse_move(ui, x + 12, y);
+            run(ui, build_read_only_plan, &plan, 1);
+            CHECK(plan.activated == 0);
+
+            /* Press, release and further motion all before one frame: still a click. */
+            cui_input_mouse_move(ui, x, y);
+            run(ui, build_read_only_plan, &plan, 1);
+            cui_input_mouse_button(ui, CUI_MOUSE_LEFT, true);
+            cui_input_mouse_button(ui, CUI_MOUSE_LEFT, false);
+            cui_input_mouse_move(ui, x + 12, y);
+            run(ui, build_read_only_plan, &plan, 2);
+            CHECK(plan.activated == 0);
+
+            /* The window loses focus after motion beyond the threshold, before a frame: a drag,
+             * measured where the pointer was last seen, not where the previous click ended. */
+            cui_input_mouse_move(ui, x, y);
+            run(ui, build_read_only_plan, &plan, 1);
+            cui_input_mouse_button(ui, CUI_MOUSE_LEFT, true);
+            run(ui, build_read_only_plan, &plan, 1);
+            cui_input_mouse_move(ui, x + 12, y);
+            cui_input_focus(ui, false);
+            run(ui, build_read_only_plan, &plan, 1);
+            CHECK(plan.activated == -1);
+            cui_input_focus(ui, true);
+        }
+        cui_destroy(ui);
+    }
+}
+
+typedef struct { cui_cal_event ev[2]; cui_gantt_task tasks[2]; bool gantt, read_only, disabled; int count; } held_plan;
+
+/** Build a week calendar or a Gantt chart whose editability, input and item count the test changes. */
+static void build_held_plan(cui_ctx *ui, void *user) {
+    held_plan *p = user;
+    const cui_date origin = { 2026, 3, 2 };
+    cui_column(ui, .pad = 16, .width = CUI_FILL) {
+        cui_push_disabled(ui, p->disabled);
+        if (p->gantt)
+            cui_gantt(ui, "gt", p->tasks, p->count, origin, 30, .day_width = 30, .row_height = 40, .read_only = p->read_only);
+        else
+            cui_week_calendar(ui, "wk", origin, p->ev, p->count, .start_hour = 8, .end_hour = 18, .hour_height = 40,
+                              .height = CUI_PX(500), .read_only = p->read_only);
+        cui_pop_disabled(ui);
+    }
+}
+
+/** A drag that was interrupted by read-only mode, disabled input or the item going away
+ *  does not come back when the item can be edited again while the button is still held. */
+static void test_planning_drag_interrupted(void) {
+    enum { READ_ONLY, DISABLED, REMOVE_LAST, REMOVE_FIRST, CUT_COUNT };
+    printf("planning: an interrupted drag needs a new press\n");
+    for (int gantt = 0; gantt < 2; gantt++)
+        for (int cut = 0; cut < CUT_COUNT; cut++) {
+            cui_ctx *ui = new_ctx();
+            cui_set_viewport(ui, 900, 800, 1);
+            held_plan p = { .gantt = gantt != 0, .count = 2 };
+            p.ev[0] = (cui_cal_event){ "Review", NULL, 1, 10, 11, CUI_TONE_INFO };
+            p.ev[1] = (cui_cal_event){ "Lunch", NULL, 3, 12, 13, CUI_TONE_SUCCESS };
+            p.tasks[0] = (cui_gantt_task){ "Build", NULL, 2, 6, 0, CUI_TONE_INFO, -1, false };
+            p.tasks[1] = (cui_gantt_task){ "Ship", NULL, 10, 14, 0, CUI_TONE_SUCCESS, -1, false };
+            run(ui, build_held_plan, &p, 3);
+            int dragged = cut == REMOVE_FIRST ? 0 : 1;
+            const cui_gantt_task initial_task = p.tasks[dragged];
+            const cui_cal_event initial_event = p.ev[dragged];
+            float x, y, dx = 0, dy = 0;
+            if (gantt) {
+                cui_rect g = rect_of(ui, cui_make_id(ui, "gt"));
+                x = g.x + 231 + (initial_task.start + initial_task.end) * 0.5f * 30;
+                y = g.y + 53 + dragged * 40 + 20;
+                dx = 30;
+            } else {
+                cui_rect w = rect_of(ui, cui_make_id(ui, "wk"));
+                x = w.x + 60 + (initial_event.day + 0.5f) * (w.w - 60) / 7;
+                y = w.y + 57 + ((initial_event.start + initial_event.end) * 0.5f - 8) * 40;
+                dy = 40;
+            }
+            /* Prove the press started a drag before changing the item list or editability. */
+            cui_input_mouse_move(ui, x, y);
+            run(ui, build_held_plan, &p, 1);
+            cui_input_mouse_button(ui, CUI_MOUSE_LEFT, true);
+            run(ui, build_held_plan, &p, 1);
+            cui_input_mouse_move(ui, x + dx, y + dy);
+            run(ui, build_held_plan, &p, 1);
+            CHECK(gantt ? p.tasks[dragged].start == initial_task.start + 1 && p.tasks[dragged].end == initial_task.end + 1
+                        : p.ev[dragged].start == initial_event.start + 1 && p.ev[dragged].end == initial_event.end + 1);
+            cui_cal_event ev = p.ev[1];
+            cui_gantt_task task = p.tasks[1];
+            if (cut == READ_ONLY) p.read_only = true;
+            if (cut == DISABLED) p.disabled = true;
+            if (cut == REMOVE_LAST) p.count = 1;
+            if (cut == REMOVE_FIRST) {
+                /* The old index is still valid, but belongs to the surviving item. */
+                p.ev[0] = ev;
+                p.tasks[0] = task;
+                p.count = 1;
+            }
+            run(ui, build_held_plan, &p, 1);
+            p.read_only = p.disabled = false;
+            if (cut != REMOVE_FIRST) p.count = 2;
+            run(ui, build_held_plan, &p, 1);
+            for (int i = 2; i <= 4; i++) { cui_input_mouse_move(ui, x + i * dx, y + i * dy); run(ui, build_held_plan, &p, 1); }
+            cui_input_mouse_button(ui, CUI_MOUSE_LEFT, false);
+            run(ui, build_held_plan, &p, 1);
+            int remaining = cut == REMOVE_FIRST ? 0 : 1;
+            if (gantt) {
+                CHECK(p.tasks[remaining].start == task.start && p.tasks[remaining].end == task.end);
+            } else {
+                CHECK(p.ev[remaining].day == ev.day && p.ev[remaining].start == ev.start && p.ev[remaining].end == ev.end);
+            }
+            cui_destroy(ui);
+        }
+}
+
 static void test_planning(void) {
     printf("planning: kanban drag between and within columns, week calendar move and resize, gantt reschedule\n");
     cui_ctx *ui = new_ctx();
@@ -4178,14 +7307,14 @@ static void test_viz(void) {
     CHECK(a.hit == 1);
     /* sankey: node C sits in the middle column */
     a.mode = 6; a.hit = -1; run(ui, build_viz, &a, 3); r = rect_of(ui, a.id);
-    /* scan the middle for node C by clicking on a grid; only nodes report clicks */
+    /* scan the middle for node C; links report indices after the four nodes */
     int got_c = 0, other = 0;
     for (float x = r.x + r.w * 0.2f; x < r.x + r.w * 0.8f && !got_c; x += 4)
         for (float y = r.y + 4; y < r.y + r.h && !got_c; y += 12) {
             a.hit = -1;
             click_at(ui, build_viz, &a, x, y);
             if (a.hit == 2) got_c = 1;
-            else if (a.hit >= 0) other = 1;
+            else if (a.hit >= 0 && a.hit < 4) other = 1;
         }
     CHECK(got_c && !other);
     /* rings: the outer ring is item 0 */
@@ -4245,6 +7374,38 @@ static void build_motion(cui_ctx *ui, void *u) {
         }
         a->dock_id = cui_last_id(ui);
     }
+}
+
+/** Four tabs make it possible to distinguish a single step from a cascade. */
+static void build_tab_step(cui_ctx *ui, void *user) {
+    static const cui_tab_bar_item tabs[] = { { NULL, "Home", 0 }, { NULL, "Search", 0 },
+                                             { NULL, "Inbox", 0 }, { NULL, "Profile", 0 } };
+    cui_tab_bar(ui, "tabs", tabs, 4, user);
+}
+
+/** Each arrow moves one tab unless a mouse press takes focus in that frame. */
+static void test_tab_step(void) {
+    printf("tab bar: one step per arrow press\n");
+    cui_ctx *ui = new_ctx();
+    int selected = 0;
+    run(ui, build_tab_step, &selected, 3);
+    key(ui, build_tab_step, &selected, CUI_KEY_TAB, 0);
+    key(ui, build_tab_step, &selected, CUI_KEY_RIGHT, 0);
+    CHECK(selected == 1);
+    key(ui, build_tab_step, &selected, CUI_KEY_LEFT, 0);
+    CHECK(selected == 0);
+    cui_rect bar = cui_last_rect(ui);
+    cui_input_mouse_move(ui, bar.x + bar.w * 0.875f, bar.y + bar.h / 2);
+    run(ui, build_tab_step, &selected, 1);
+    cui_input_key(ui, CUI_KEY_RIGHT, true, 0);
+    cui_input_mouse_button(ui, CUI_MOUSE_LEFT, true);
+    run(ui, build_tab_step, &selected, 1);
+    CHECK(selected == 0);
+    cui_input_key(ui, CUI_KEY_RIGHT, false, 0);
+    cui_input_mouse_button(ui, CUI_MOUSE_LEFT, false);
+    run(ui, build_tab_step, &selected, 1);
+    CHECK(selected == 3);
+    cui_destroy(ui);
 }
 
 static void test_motion(void) {
@@ -4862,7 +8023,17 @@ static void test_hex_view(void) {
     run(ui, build_hex, &h, 20);
     p = hex_cell(ui, 0, 0, false);
     cui_input_mouse_move(ui, p.x, p.y);
+    cui_set_reduced_motion(ui, false);
+    run(ui, build_hex, &h, 90);
+    CHECK(!cui_needs_redraw(ui));
+    CHECK(h.res.hovered == 0);
     cui_input_scroll(ui, 0, -2);
+    cui_begin_frame(ui, 1.0f);
+    build_hex(ui, &h);
+    cui_end_frame(ui);
+    /* Hit testing on the next frame sees the first frame's scroll position. */
+    run(ui, build_hex, &h, 1);
+    CHECK(h.res.hovered > 0 && h.res.hovered < 16 * 6);
     run(ui, build_hex, &h, 20);
     CHECK(h.res.hovered == 16 * 6);
     cui_destroy(ui);
@@ -5250,6 +8421,62 @@ static void build_flame(cui_ctx *ui, void *u) {
 }
 static cui_vec2 flame_at(flame_ctx *f, cui_ctx *ui, int i) { return center(cui_flame_span_rect(ui, f->id, &f->s[i])); }
 
+/** Draw the flame graph inside a disabled scope. */
+static void build_disabled_flame(cui_ctx *ui, void *user) {
+    flame_ctx *f = user;
+    cui_push_disabled(ui, true);
+    build_flame(ui, f);
+    cui_pop_disabled(ui);
+}
+
+/** The wheel can zoom an enabled flame graph and leaves a disabled one unchanged. */
+static void test_disabled_flame_wheel(void) {
+    printf("flame graph: disabled wheel leaves the view unchanged\n");
+    static const cui_flame_span spans[] = { { "frame", 0, 10, 0, 0 } };
+    cui_ctx *ui = new_ctx();
+    flame_ctx f = { .s = spans, .n = 1, .sel = -1, .height = 200 };
+    run(ui, build_flame, &f, 3);
+    cui_vec2 at = center(rect_of(ui, f.id));
+    cui_input_mouse_move(ui, at.x, at.y);
+    run(ui, build_flame, &f, 1);
+    cui_input_scroll(ui, 0, 2);
+    run(ui, build_disabled_flame, &f, 1);
+    CHECK(f.view.start == 0 && f.view.end == 10 && !f.last.view_changed);
+    run(ui, build_flame, &f, 2);
+    cui_input_scroll(ui, 0, 2);
+    run(ui, build_flame, &f, 1);
+    CHECK(f.view.end - f.view.start < 10);
+    cui_destroy(ui);
+}
+
+/** A disabled graph still fits its view to the current spans. */
+static void test_disabled_flame_shrinks(void) {
+    printf("flame graph: disabled view follows a smaller dataset\n");
+    cui_flame_span deep[20];
+    for (int i = 0; i < 20; i++) deep[i] = (cui_flame_span){ "frame", 0, 10, i, 0 };
+    deep[1].end = 1;
+    static const cui_flame_span shallow = { "frame", 4, 6, 0, 0 };
+    cui_ctx *ui = new_ctx();
+    flame_ctx f = { .s = deep, .n = 20, .sel = -1, .height = 200 };
+    run(ui, build_flame, &f, 3);
+    f.view.scroll = 100;
+    cui_set_reduced_motion(ui, false);
+    f.sel = 1;
+    key(ui, build_flame, &f, CUI_KEY_TAB, 0);
+    key(ui, build_flame, &f, CUI_KEY_ENTER, 0);
+    CHECK(f.last.zoomed == 1 && f.view.end > 6);
+    run(ui, build_flame, &f, 1);
+    CHECK(f.view.scroll == 100);
+    f.s = &shallow;
+    f.n = 1;
+    run(ui, build_disabled_flame, &f, 1);
+    CHECK(f.view.scroll == 0);
+    CHECK(f.view.start == 4 && f.view.end == 6 && f.last.view_changed);
+    run(ui, build_flame, &f, 1);
+    CHECK(f.view.start == 4 && f.view.end == 6);
+    cui_destroy(ui);
+}
+
 static void test_flame(void) {
     printf("flame graph: fit, select, keys, zoom about the pointer, pan, zoom to span, reset, tooltip, 100k spans, empty\n");
     static const cui_flame_span small[] = {
@@ -5480,6 +8707,34 @@ static void ced_text(ced_ctx *c, const char *s) { snprintf(c->buf, sizeof c->buf
 /* caret (or a selection) from code; also focuses the editor */
 static void ced_sel(cui_ctx *ui, ced_ctx *c, int a, int b) { cui_code_editor_select(ui, "ed", a, b); run(ui, build_ced, c, 1); }
 static int ced_at(const ced_ctx *c, const char *needle) { const char *p = strstr(c->buf, needle); return p ? (int)(p - c->buf) : -1; }
+
+/* Keep line numbers and other controls out of the glyph count. */
+static void build_ced_render(cui_ctx *ui, void *u) {
+    ced_ctx *c = u;
+    cui_code_editor(ui, "ed", c->buf, sizeof c->buf, .lang = c->lang,
+                    .read_only = true, .no_line_numbers = true, .height = 200, .tab_size = 4);
+}
+
+static void test_code_editor_indented_text(void) {
+    printf("code editor: visible text after leading spaces and tabs\n");
+    static const char *const langs[] = { "text", "plain", "c", NULL };
+    static const char *const inputs[] = { "abc", "\tabc", "    abc", "a\tbc", "\t\tabc", " \tabc" };
+    for (int l = 0; l < 4; l++) {
+        for (int i = 0; i < 6; i++) {
+            cui_ctx *ui = new_ctx();
+            ced_ctx c = {0};
+            c.lang = langs[l];
+            ced_text(&c, inputs[i]);
+            run(ui, build_ced_render, &c, 3);
+            const cui_draw_data *dd = cui_get_draw_data(ui);
+            int glyph_vertices = 0;
+            for (int v = 0; v < dd->vertex_count; v++)
+                if (dd->vertices[v].mode == CUI_SHADE_TEXT) glyph_vertices++;
+            CHECK(glyph_vertices == 3 * 4);   /* a, b, c each emit one quad */
+            cui_destroy(ui);
+        }
+    }
+}
 
 static void test_code_editor(void) {
     printf("code editor: typing, indentation, undo, clipboard, find, brackets, capacity, virtualization\n");
@@ -6267,6 +9522,50 @@ static void build_cs(cui_ctx *ui, void *u) {
         c->r = cui_last_rect(ui);
     }
 }
+typedef struct { bool disabled; cui_candle candles[80]; cui_rect rect; } candle_wheel_case;
+
+/** Build a chart whose disabled state can change after wheel routing. */
+static void build_candle_wheel(cui_ctx *ui, void *user) {
+    candle_wheel_case *c = user;
+    cui_push_disabled(ui, c->disabled);
+    cui_candlestick(ui, "candles", c->candles, 80, .height = 180);
+    c->rect = cui_last_rect(ui);
+    cui_pop_disabled(ui);
+}
+
+/** A queued wheel event leaves the disabled chart at its previous viewport. */
+static void test_disabled_candlestick_wheel(void) {
+    printf("candlestick: disabling after wheel routing preserves the viewport\n");
+    cui_ctx *ui = new_ctx();
+    candle_wheel_case c = {0};
+    cui_set_viewport(ui, 480, 240, 1);
+    for (int i = 0; i < 80; i++) {
+        float value = 100 + (float)(i % 17);
+        c.candles[i] = (cui_candle){ value, value + 3, value - 2, value + 1, 0 };
+    }
+    run(ui, build_candle_wheel, &c, 4);
+    cui_vec2 p = center(c.rect);
+    cui_input_mouse_move(ui, p.x, p.y);
+    run(ui, build_candle_wheel, &c, 2);
+    c.disabled = true;
+    run(ui, build_candle_wheel, &c, 1);
+    uint32_t before = frame_hash(ui);
+    c.disabled = false;
+    run(ui, build_candle_wheel, &c, 2);
+    c.disabled = true;
+    cui_input_scroll(ui, 0, 3);
+    run(ui, build_candle_wheel, &c, 1);
+    CHECK(frame_hash(ui) == before);
+    c.disabled = false;
+    run(ui, build_candle_wheel, &c, 2);
+    cui_input_scroll(ui, 0, 3);
+    run(ui, build_candle_wheel, &c, 1);
+    c.disabled = true;
+    run(ui, build_candle_wheel, &c, 1);
+    CHECK(frame_hash(ui) != before);
+    cui_destroy(ui);
+}
+
 static void test_candles(void) {
     cui_ctx *ui = new_ctx();
     enum { N = 100000 };
@@ -6369,6 +9668,143 @@ static void test_strings(void) {
     cui_destroy(ui);
 }
 
+/* ---- syntax colors: SQL ---- */
+typedef struct { const char *src, *lang; } sqlc_ctx;
+static void build_sqlc(cui_ctx *ui, void *u) {
+    sqlc_ctx *c = u;
+    cui_column(ui, .pad = 10) { cui_code_block(ui, "q", c->src, .lang = c->lang, .no_header = true); }
+}
+static bool has_color(cui_ctx *ui, cui_color want) {
+    const cui_draw_data *d = cui_get_draw_data(ui);
+    for (int i = 0; i < d->vertex_count; i++) {
+        cui_color k = d->vertices[i].color;
+        if (k.r == want.r && k.g == want.g && k.b == want.b && k.a == want.a) return true;
+    }
+    return false;
+}
+/** Does this source, in this language, draw anything in the color? */
+static bool code_has(const char *lang, const char *src, cui_color want) {
+    cui_ctx *ui = new_ctx();
+    sqlc_ctx c = { src, lang };
+    run(ui, build_sqlc, &c, 2);
+    bool r = has_color(ui, want);
+    cui_destroy(ui);
+    return r;
+}
+/** SQL keywords match in any case, -- and block comments hide them, and other languages stay case-sensitive. */
+static void test_sql_colors(void) {
+    printf("syntax colors: SQL\n");
+    cui_color kw = cui_oklch(0.52f, 0.20f, 305, 1), ty = cui_oklch(0.52f, 0.11f, 200, 1), cn = cui_oklch(0.58f, 0.16f, 50, 1);
+    CHECK(code_has("sql", "SELECT id", kw));
+    CHECK(code_has("sql", "select id", kw));
+    CHECK(code_has("sql", "Select id", kw));
+    CHECK(!code_has("text", "SELECT id", kw));
+    CHECK(!code_has("sql", "selected id", kw));                 /* whole words only */
+    CHECK(code_has("sql", "x VARCHAR", ty));
+    CHECK(!code_has("sql", "x Users", ty));                     /* a capital is not a type in SQL */
+    CHECK(code_has("sql", "x IS NULL", cn));
+    CHECK(code_has("sql", "x = true", cn));
+    CHECK(!code_has("sql", "x -- SELECT", kw));                 /* a line comment */
+    CHECK(!code_has("sql", "/* a\nSELECT */ x", kw));          /* a block comment across lines */
+    CHECK(code_has("sql", "/* a */ SELECT", kw));
+    CHECK(code_has("c", "if x", kw));
+    CHECK(!code_has("c", "IF x", kw));                          /* C keeps its case */
+}
+
+/* ---- calendar: months and years ---- */
+/* the draw without texture coordinates, which depend on the order glyphs entered the atlas */
+static uint64_t shape_hash(cui_ctx *ui) {
+    const cui_draw_data *d = cui_get_draw_data(ui);
+    uint64_t h = 1469598103934665603ull;
+    for (int i = 0; i < d->vertex_count; i++) {
+        cui_vertex v = d->vertices[i];
+        v.u = v.v = 0;
+        const unsigned char *b = (const unsigned char *)&v;
+        for (size_t k = 0; k < sizeof v; k++) h = (h ^ b[k]) * 1099511628211ull;
+    }
+    return h;
+}
+typedef struct { cui_date d; bool changed; } calpick_ctx;
+static void build_calpick(cui_ctx *ui, void *u) {
+    calpick_ctx *c = u;
+    cui_column(ui, .pad = 10) { if (cui_calendar(ui, "cal", &c->d)) c->changed = true; }
+}
+static void tab_n(cui_ctx *ui, build_fn fn, void *u, int n) { for (int i = 0; i < n; i++) key(ui, fn, u, CUI_KEY_TAB, 0); }
+/** The title opens the months, the year opens twelve years, and a choice goes back down to the days. */
+static void test_calendar_years(void) {
+    printf("calendar: months and years from the title\n");
+    cui_ctx *ui = new_ctx();
+    calpick_ctx c = { { 2026, 11, 14 }, false };
+    run(ui, build_calpick, &c, 3);
+    cui_id cal = cui_make_id(ui, "cal");
+    cui_rect days = rect_of(ui, cal);
+    uint64_t days_hash = shape_hash(ui);
+    tab_n(ui, build_calpick, &c, 1);                 /* the title */
+    key(ui, build_calpick, &c, CUI_KEY_ENTER, 0);    /* the months of 2026 */
+    run(ui, build_calpick, &c, 2);
+    cui_rect months = rect_of(ui, cal);
+    CHECK(shape_hash(ui) != days_hash);
+    CHECK_NEAR(months.w, days.w, 0.01);              /* the same size in every view */
+    CHECK_NEAR(months.h, days.h, 0.01);
+    tab_n(ui, build_calpick, &c, 5);                 /* previous, next, Jan, Feb, Mar */
+    key(ui, build_calpick, &c, CUI_KEY_ENTER, 0);    /* March 2026, the value unchanged */
+    CHECK(!c.changed);
+    CHECK(c.d.year == 2026 && c.d.month == 11 && c.d.day == 14);
+    click_at(ui, build_calpick, &c, 400, 400);       /* drop the focus ring */
+    run(ui, build_calpick, &c, 2);
+    uint64_t march = shape_hash(ui);
+    {
+        cui_ctx *ref = new_ctx();
+        calpick_ctx rc = { { 2026, 3, 0 }, false };  /* a calendar that opens on March 2026 with no day chosen */
+        run(ref, build_calpick, &rc, 3);
+        CHECK(shape_hash(ref) == march);
+        cui_destroy(ref);
+    }
+    /* the years: two Enters on the title, a page back, then 2010, May and the 15th */
+    tab_n(ui, build_calpick, &c, 1);
+    key(ui, build_calpick, &c, CUI_KEY_ENTER, 0);    /* months */
+    key(ui, build_calpick, &c, CUI_KEY_ENTER, 0);    /* 2016 to 2027 */
+    tab_n(ui, build_calpick, &c, 1);
+    key(ui, build_calpick, &c, CUI_KEY_ENTER, 0);    /* earlier: 2004 to 2015 */
+    tab_n(ui, build_calpick, &c, 8);                 /* next, 2004 ... 2010 */
+    key(ui, build_calpick, &c, CUI_KEY_ENTER, 0);    /* the months of 2010, the focus on the title */
+    tab_n(ui, build_calpick, &c, 7);                 /* previous, next, Jan ... May */
+    key(ui, build_calpick, &c, CUI_KEY_ENTER, 0);    /* May 2010 */
+    CHECK(!c.changed);
+    tab_n(ui, build_calpick, &c, 2 + 20);            /* previous, next, then 1 May 2010 is a Saturday: the 15th is the 20th day cell */
+    key(ui, build_calpick, &c, CUI_KEY_ENTER, 0);
+    CHECK(c.changed);
+    CHECK(c.d.year == 2010 && c.d.month == 5 && c.d.day == 15);
+    cui_destroy(ui);
+}
+
+typedef struct { cui_date d; cui_id field; } dpick_ctx;
+static void build_dpick(cui_ctx *ui, void *u) {
+    dpick_ctx *c = u;
+    cui_column(ui, .pad = 10) { cui_date_picker(ui, "dp", &c->d); c->field = cui_last_id(ui); }
+}
+/** A picker that closes in the months view opens on the days again. */
+static void test_date_picker_reopens_on_days(void) {
+    printf("date picker: opens on the days again\n");
+    cui_ctx *ui = new_ctx();
+    dpick_ctx c = { { 2026, 11, 14 }, 0 };
+    run(ui, build_dpick, &c, 3);
+    cui_vec2 f = center(rect_of(ui, c.field));
+    click_at(ui, build_dpick, &c, f.x, f.y);
+    run(ui, build_dpick, &c, 30);
+    uint64_t opened = shape_hash(ui);
+    tab_n(ui, build_dpick, &c, 1);                   /* from the field to the calendar's title */
+    key(ui, build_dpick, &c, CUI_KEY_ENTER, 0);
+    run(ui, build_dpick, &c, 30);
+    CHECK(shape_hash(ui) != opened);                 /* the months */
+    key(ui, build_dpick, &c, CUI_KEY_ESCAPE, 0);
+    run(ui, build_dpick, &c, 30);
+    click_at(ui, build_dpick, &c, f.x, f.y);
+    run(ui, build_dpick, &c, 30);
+    CHECK(shape_hash(ui) == opened);
+    cui_destroy(ui);
+}
+
 /* ---- month calendar ---- */
 typedef struct { cui_date month, sel; const cui_month_event *ev; int n; cui_month_result r; cui_rect gr; float w; } mc_ctx;
 static void build_mc(cui_ctx *ui, void *u) {
@@ -6423,6 +9859,15 @@ static void test_month(void) {
     CHECK(c.month.year == 2027 && c.month.month == 1 && c.sel.day == 4);
     key(ui, build_mc, &c, CUI_KEY_HOME, 0);
     CHECK(c.month.year == 2026 && c.month.month == 11 && c.sel.day == 8);
+    /* The pointer stays on the 20th while the keyboard selects a different day. */
+    key(ui, build_mc, &c, CUI_KEY_RIGHT, 0);
+    key(ui, build_mc, &c, CUI_KEY_ENTER, 0);
+    CHECK(c.r.day_clicked && c.r.day_activated && c.sel.day == 9);
+    key(ui, build_mc, &c, CUI_KEY_HOME, 0);
+    key(ui, build_mc, &c, CUI_KEY_SPACE, 0);
+    CHECK(c.r.day_clicked && !c.r.day_activated && c.sel.day == 8);
+    click_at(ui, build_mc, &c, c.gr.x + cw * 4.5f, c.gr.y + ch * 3 + 80);
+    CHECK(c.r.day_clicked && c.sel.day == 20);
     /* many events stay cheap: 5,000 in a month */
     enum { M = 5000 };
     cui_month_event *many = malloc(sizeof *many * M);
@@ -6587,6 +10032,69 @@ static void test_photo(void) {
     cui_destroy(ui);
 }
 
+/* ---- wheel areas inside a moved node ---- */
+/* A carousel draws its slides moved by the slide row's translation; a wheel area must be where the
+ * component is drawn, not where it was laid out. */
+typedef struct { cui_texture tex; cui_image_view view[2]; int slide; cui_id wheel; int takes; } moved_wheel;
+static void paint_moved_wheel(cui_ctx *ui, cui_rect r, void *user) { cui_wheel_region(ui, *(const cui_id *)user, r); }
+static void build_moved_wheel(cui_ctx *ui, void *u) {
+    moved_wheel *m = u;
+    cui_carousel(ui, "photos", 2, &m->slide, .height = 300, .no_arrows = true) {
+        cui_carousel_slide(ui) { cui_image_viewer(ui, "photo-1", m->tex, 1000, 500, &m->view[0], .width = CUI_PX(500), .height = CUI_PX(300), .no_toolbar = true); }
+        cui_carousel_slide(ui) {
+            cui_row(ui) {
+                cui_image_viewer(ui, "photo-2", m->tex, 1000, 500, &m->view[1], .width = CUI_PX(500), .height = CUI_PX(300), .no_toolbar = true);
+                m->wheel = cui_make_id(ui, "canvas-wheel");
+                cui_vec2 d;
+                if (cui_wheel_take(ui, m->wheel, &d)) m->takes++;
+                cui_canvas(ui, "canvas", CUI_PX(200), CUI_PX(300), paint_moved_wheel, &m->wheel, sizeof m->wheel);
+            }
+        }
+    }
+}
+static void test_wheel_in_moved_node(void) {
+    printf("wheel areas and zoom anchors follow their node's translation (a carousel's second slide)\n");
+    static unsigned char px[64 * 64 * 4];
+    memset(px, 200, sizeof px);
+    for (int start = 0; start < 2; start++) {
+        cui_ctx *ui = new_ctx();
+        moved_wheel m = { .slide = start };
+        m.tex = cui_image_create(ui, 64, 64, px);
+        run(ui, build_moved_wheel, &m, 3);
+        const cui_rect car = rect_of(ui, cui_make_id(ui, "photos"));
+        const cui_rect p1 = rect_of(ui, cui_make_id(ui, "photo-1")), p2 = rect_of(ui, cui_make_id(ui, "photo-2"));
+        if (start == 1) CHECK(p2.x > car.x + car.w);   /* laid out outside the carousel, drawn inside it */
+        /* the shown photo is drawn where the first slide's is laid out; the pointer a quarter in */
+        const cui_rect shown = start ? (cui_rect){ p1.x, p2.y, p2.w, p2.h } : p1;
+        const float mx = shown.x + shown.w * 0.25f, my = shown.y + shown.h * 0.5f;
+        const float fit = fminf(shown.w / 1000, shown.h / 500);
+        const float ix = 500 + (mx - (shown.x + shown.w / 2)) / fit;   /* the image point under it */
+        cui_input_mouse_move(ui, mx, my);
+        run(ui, build_moved_wheel, &m, 2);
+        cui_input_scroll(ui, 0, 1);
+        run(ui, build_moved_wheel, &m, 3);
+        const cui_image_view v = m.view[start];
+        CHECK(v.zoom > fit * 1.1f);
+        CHECK(m.view[1 - start].zoom == 0);
+        CHECK_NEAR(v.cx + (mx - (shown.x + shown.w / 2)) / v.zoom, ix, 1.0);   /* it zoomed around the pointer */
+        /* a double-click shows 100% around the pointer, too */
+        click_at(ui, build_moved_wheel, &m, mx, my);
+        click_at(ui, build_moved_wheel, &m, mx, my);
+        run(ui, build_moved_wheel, &m, 3);
+        CHECK_NEAR(m.view[start].zoom, 1, 1e-4);
+        CHECK_NEAR(m.view[start].cx + (mx - (shown.x + shown.w / 2)), ix, 1.0);
+        if (start == 1) {                               /* over the canvas next to it: its wheel region takes it */
+            cui_input_mouse_move(ui, car.x + 600, car.y + 150);
+            run(ui, build_moved_wheel, &m, 2);
+            cui_input_scroll(ui, 0, 1);
+            run(ui, build_moved_wheel, &m, 3);
+            CHECK(m.takes == 1);
+        }
+        cui_image_destroy(ui, m.tex);
+        cui_destroy(ui);
+    }
+}
+
 /* ---- file browser and file picker ---- */
 static const struct { const char *dir, *name; bool folder; uint64_t size; } fb_disk[] = {
     { "/w", "beta", true, 0 }, { "/w", "Alpha", true, 0 }, { "/w", "zeta.txt", false, 30 }, { "/w", "img10.png", false, 900 },
@@ -6699,6 +10207,26 @@ static void test_files(void) {
     CHECK(n > 0);
     CHECK(cui_fs_list(NULL, "./no/such/folder/here", ents, 64, names, sizeof names, true) == -1);
     cui_destroy(ui);
+}
+
+/* a names buffer filled exactly by the first entry: on Windows the next
+ * conversion only measured, and the entry after it pointed past the buffer */
+static void test_fs_list_full_names(void) {
+    printf("file browser: a names buffer that fills up exactly\n");
+    cui_file_entry ents[64];
+    char names[8192];
+    int n = cui_fs_list(NULL, ".", ents, 64, names, sizeof names, true);
+    CHECK(n > 1);
+    if (n < 2) return;
+    size_t cap = strlen(ents[0].name) + 1;   /* room for the first entry and nothing more */
+    char *exact = malloc(cap);
+    n = cui_fs_list(NULL, ".", ents, 64, exact, cap, true);
+    CHECK(n <= 1);
+    bool inside = true;
+    for (int i = 0; i < n; i++)
+        if (ents[i].name < exact || ents[i].name >= exact + cap || ents[i].name + strlen(ents[i].name) >= exact + cap) inside = false;
+    CHECK(inside);
+    free(exact);
 }
 
 /* ---- terminal ---- */
@@ -7030,6 +10558,39 @@ static void test_atlas_shrink(void) {
     cui_destroy(ui);
 }
 
+/* ---- glyph atlas: a glyph wider than the atlas grows it, a huge one is skipped ---- */
+typedef struct { float dash, first; } wide_ctx;
+static void build_wide(cui_ctx *ui, void *u) {
+    wide_ctx *c = u;
+    if (c->first > 0) cui_draw_text(ui, CUI_FONT_BODY, c->first, (cui_vec2){ 0, 0 }, CUI_RGB(0), "H", -1);
+    cui_draw_text(ui, CUI_FONT_BODY, c->dash, (cui_vec2){ 0, 100 }, CUI_RGB(0), "\xe2\x80\x94", -1);   /* an em dash: wide and flat */
+}
+static void test_atlas_wide_glyph(void) {
+    printf("glyph atlas: a glyph wider than the atlas grows it, one too big for any atlas is skipped\n");
+    at_inner = cui_sw_iface(g_sw);
+    cui_renderer_iface r = at_inner;
+    r.texture_create = at_create;
+    cui_ctx *ui = cui_create(&(cui_ctx_desc){ .renderer = r });
+    cui_set_viewport(ui, 20000, 20000, 1);
+    cui_set_reduced_motion(ui, true);
+    /* about 2000 pixels wide and 160 tall: the height fits the first atlas, the width does not */
+    wide_ctx c = { 2000, 0 };
+    run(ui, build_wide, &c, 2);
+    CHECK(at_w >= 2048);
+    /* compacting keeps the atlas wide enough for it while it is still drawn */
+    for (int i = 0; i < 700; i++) { cui_input_mouse_move(ui, (float)(i % 50), 5); run(ui, build_wide, &c, 1); }
+    CHECK(at_w >= 2048);
+    cui_destroy(ui);
+    /* about 12000 pixels wide, low enough in the atlas that its rows used to run past the end */
+    ui = cui_create(&(cui_ctx_desc){ .renderer = r });
+    cui_set_viewport(ui, 20000, 20000, 1);
+    cui_set_reduced_motion(ui, true);
+    c.dash = 12000; c.first = 60;
+    run(ui, build_wide, &c, 2);
+    CHECK(at_w < 4096);   /* skipped up front, not grown to the limit and then reset */
+    cui_destroy(ui);
+}
+
 /* ---- software renderer: incremental frames equal full ones ---- */
 static cui_sw_renderer *inc_a, *inc_b;
 static cui_texture inc_create(void *u, int w, int h, cui_texture_format f, const void *px) {
@@ -7049,6 +10610,9 @@ static void inc_update(void *u, cui_texture t, int x, int y, int w, int h, const
 static void inc_destroy(void *u, cui_texture t) {
     (void)u;
     cui_renderer_iface a = cui_sw_iface(inc_a), b = cui_sw_iface(inc_b);
+    test_stepper_width_isolation();
+    test_pagination_unnamed_width();
+    test_navigation_focus_visible();
     a.texture_destroy(a.user, t);
     b.texture_destroy(b.user, t);
 }
@@ -7108,6 +10672,48 @@ static void test_sw_incremental(void) {
     free(A); free(B);
 }
 
+/* ---- software renderer: empty textures and updates that hang over an edge ---- */
+typedef struct { cui_texture empty, quad; } swtex_ctx;
+static void build_swtex(cui_ctx *ui, void *u) {
+    swtex_ctx *c = u;
+    cui_draw_image(ui, c->empty, (cui_rect){ 50, 0, 40, 40 }, (cui_rect){ 0, 0, 1, 1 }, CUI_CORNERS(0), CUI_RGB(0xffffff));
+    cui_draw_image(ui, c->quad, (cui_rect){ 0, 0, 40, 40 }, (cui_rect){ 0, 0, 1, 1 }, CUI_CORNERS(0), CUI_RGB(0xffffff));
+}
+static void test_sw_texture_edges(void) {
+    printf("software renderer: an empty texture samples nothing, updates clip to the texture\n");
+    cui_sw_renderer *sw = cui_sw_create();
+    cui_renderer_iface r = cui_sw_iface(sw);
+    cui_ctx *ui = cui_create(&(cui_ctx_desc){ .renderer = r });
+    cui_set_viewport(ui, 100, 50, 1);
+    cui_set_reduced_motion(ui, true);
+    swtex_ctx c;
+    unsigned char blue[4 * 4 * 4], red[4 * 4 * 4], green[4 * 4 * 4];
+    for (int i = 0; i < 16; i++) {
+        unsigned char *b = blue + i * 4, *rd = red + i * 4, *g = green + i * 4;
+        b[0] = 0; b[1] = 0; b[2] = 255; b[3] = 255;
+        rd[0] = 255; rd[1] = 0; rd[2] = 0; rd[3] = 255;
+        g[0] = 0; g[1] = 255; g[2] = 0; g[3] = 255;
+    }
+    c.empty = r.texture_create(r.user, 0, 0, CUI_TEXTURE_RGBA8, blue);   /* was sampled at index -1 */
+    c.quad = r.texture_create(r.user, 4, 4, CUI_TEXTURE_RGBA8, blue);
+    r.texture_update(r.user, c.quad, 2, 0, 4, 4, red, 16);     /* two columns past the right edge */
+    r.texture_update(r.user, c.quad, -3, 0, 4, 4, green, 16);  /* three columns before the left one */
+    run(ui, build_swtex, &c, 1);
+    unsigned char *px = calloc(100 * 50, 4);
+    const cui_draw_data *dd = cui_get_draw_data(ui);
+    cui_sw_render(sw, dd, px, 100, 50, 400, CUI_SW_RGBA);
+    /* texels are 10 points wide; sampling blends a little of the neighbor in */
+    unsigned char *t0 = px + (20 * 100 + 5) * 4, *t1 = px + (20 * 100 + 15) * 4, *t3 = px + (20 * 100 + 35) * 4;
+    CHECK(t0[0] < 40 && t0[1] > 200 && t0[2] < 40);      /* the last column of the left update */
+    CHECK(t1[0] < 40 && t1[1] < 40 && t1[2] > 200);      /* untouched */
+    CHECK(t3[0] > 200 && t3[1] < 40 && t3[2] < 40);      /* the first columns of the right update */
+    free(px);
+    cui_destroy(ui);
+    r.texture_destroy(r.user, c.empty);
+    r.texture_destroy(r.user, c.quad);
+    cui_sw_destroy(sw);
+}
+
 /* ---- the emoji texture goes when no emoji is drawn for a while ---- */
 static cui_renderer_iface et_inner;
 static int et_rgba_live;
@@ -7149,11 +10755,218 @@ static void test_emoji_release(void) {
     CHECK(et_rgba_live == 0);
 }
 
+static int g_touch_hook_seen;
+static bool touch_hook(cui_ctx *ui, const cui_input_event *e, void *u) {
+    (void)ui; (void)u;
+    if (e->kind == CUI_INPUT_TOUCH || e->kind == CUI_INPUT_TOUCH_MOVE) g_touch_hook_seen++;
+    return false;
+}
+
+/* consuming hook that records the sequence of touch events it is offered */
+typedef struct { int kinds[8]; int count; } touch_capture;
+static bool touch_consume_hook(cui_ctx *ui, const cui_input_event *e, void *user) {
+    (void)ui;
+    touch_capture *c = user;
+    if (c->count < 8) c->kinds[c->count++] = e->kind;
+    return true;
+}
+
+/* per-frame touch flags are cleared at end_frame, so sample them in-frame */
+typedef struct { int finger; bool down, pressed, released; cui_vec2 pos; } touch_probe;
+static void build_touch_probe(cui_ctx *ui, void *u) {
+    touch_probe *p = u;
+    p->down = cui_touch_down(ui, p->finger);
+    p->pressed = cui_touch_pressed(ui, p->finger);
+    p->released = cui_touch_released(ui, p->finger);
+    p->pos = cui_touch_pos(ui, p->finger);
+}
+static touch_probe probe(cui_ctx *ui, int finger) {
+    touch_probe p = { .finger = finger };
+    run(ui, build_touch_probe, &p, 1);
+    return p;
+}
+
+static void test_touch_api(void) {
+    printf("interaction: raw multi-touch\n");
+    cui_ctx *ui = new_ctx();
+    run(ui, build_empty, NULL, 1);
+
+    /* press, move, release; per-frame flags */
+    {
+        touch_probe p = probe(ui, 0);
+        CHECK(!p.down && !p.pressed && !p.released);
+    }
+    cui_input_touch(ui, 0, true, 10, 20);
+    {
+        touch_probe p = probe(ui, 0);
+        CHECK(p.down && p.pressed && !p.released);
+        CHECK_NEAR(p.pos.x, 10, 0.01f);
+        CHECK_NEAR(p.pos.y, 20, 0.01f);
+    }
+    cui_input_touch_move(ui, 0, 30, 40);
+    {
+        touch_probe p = probe(ui, 0);
+        CHECK(p.down && !p.pressed && !p.released);
+        CHECK_NEAR(p.pos.x, 30, 0.01f);
+        CHECK_NEAR(p.pos.y, 40, 0.01f);
+    }
+    cui_input_touch(ui, 0, false, 30, 40);
+    {
+        touch_probe p = probe(ui, 0);
+        CHECK(!p.down && p.released && !p.pressed);
+    }
+    {
+        touch_probe p = probe(ui, 0);
+        CHECK(!p.released && !p.pressed);   /* released lasts one frame */
+    }
+
+    /* two fingers; finger -1 is the touch that landed first */
+    cui_input_touch(ui, 0, true, 1, 1);
+    probe(ui, 0);
+    cui_input_touch(ui, 1, true, 2, 2);
+    {
+        touch_probe p = probe(ui, -1);
+        CHECK(cui_touch_count(ui) == 2);
+        CHECK(p.down && cui_touch_down(ui, 0) && cui_touch_down(ui, 1));
+        CHECK_NEAR(p.pos.x, 1, 0.01f);
+    }
+    /* the first finger lifts: -1 moves to the second */
+    cui_input_touch(ui, 0, false, 1, 1);
+    {
+        touch_probe p = probe(ui, -1);
+        CHECK(cui_touch_count(ui) == 1);
+        CHECK_NEAR(p.pos.x, 2, 0.01f);
+    }
+    /* a new press after release lands later than the still-down finger */
+    cui_input_touch(ui, 0, true, 3, 3);
+    {
+        touch_probe p = probe(ui, -1);
+        CHECK_NEAR(p.pos.x, 2, 0.01f);
+    }
+    cui_input_touch(ui, 1, false, 2, 2);
+    cui_input_touch(ui, 0, false, 3, 3);
+    {
+        /* the frame both lift, -1 is the lifted touch that landed first */
+        touch_probe p = probe(ui, -1);
+        CHECK(cui_touch_count(ui) == 0);
+        CHECK(!p.down && p.released);
+        CHECK_NEAR(p.pos.x, 2, 0.01f);
+    }
+    {
+        touch_probe p = probe(ui, -1);
+        CHECK(!p.down && !p.released);
+        CHECK_NEAR(p.pos.x, -1e6f, 1.0f);   /* nothing down: the off-screen rest value */
+    }
+
+    /* a single finger lifting: released and the lift position, for finger 0
+     * and for -1, during the frame it lifts only */
+    cui_input_touch(ui, 0, true, 40, 50);
+    probe(ui, 0);
+    cui_input_touch(ui, 0, false, 44, 55);
+    {
+        touch_probe p = probe(ui, -1);
+        CHECK(!p.down && !p.pressed && p.released);
+        CHECK_NEAR(p.pos.x, 44, 0.01f);
+        CHECK_NEAR(p.pos.y, 55, 0.01f);
+    }
+    {
+        touch_probe p = probe(ui, 0);
+        CHECK(!p.released);
+        CHECK_NEAR(p.pos.x, -1e6f, 1.0f);
+    }
+
+    /* a tap that lands and lifts between two frames is still seen, and placed */
+    cui_input_touch(ui, 2, true, 60, 70);
+    cui_input_touch(ui, 2, false, 60, 70);
+    {
+        touch_probe p = probe(ui, -1);
+        CHECK(!p.down && p.pressed && p.released);
+        CHECK_NEAR(p.pos.x, 60, 0.01f);
+        CHECK_NEAR(p.pos.y, 70, 0.01f);
+    }
+
+    /* a repeated down for a finger already down keeps its pressed flag and
+     * its landing order */
+    cui_input_touch(ui, 0, true, 1, 1);
+    cui_input_touch(ui, 1, true, 2, 2);
+    cui_input_touch(ui, 0, true, 5, 5);
+    {
+        touch_probe p = probe(ui, 0);
+        CHECK(p.down && p.pressed);
+        CHECK_NEAR(p.pos.x, 5, 0.01f);
+        touch_probe first = probe(ui, -1);
+        CHECK_NEAR(first.pos.x, 5, 0.01f);   /* finger 0 still landed first */
+    }
+    cui_input_touch(ui, 0, false, 5, 5);
+    cui_input_touch(ui, 1, false, 2, 2);
+    probe(ui, 0);
+
+    /* cancel releases without a normal lift */
+    cui_input_touch(ui, 0, true, 5, 5);
+    probe(ui, 0);
+    cui_input_touch_cancel(ui, 0);
+    {
+        touch_probe p = probe(ui, 0);
+        CHECK(!p.down && p.released);
+    }
+
+    /* out-of-range fingers are ignored everywhere */
+    cui_input_touch(ui, -5, true, 0, 0);
+    cui_input_touch(ui, CUI_TOUCH_MAX, true, 0, 0);
+    cui_input_touch_move(ui, CUI_TOUCH_MAX + 3, 1, 1);
+    {
+        touch_probe p = probe(ui, CUI_TOUCH_MAX);
+        CHECK(cui_touch_count(ui) == 0);
+        CHECK(!p.down && !cui_touch_pressed(ui, 99));
+        CHECK(!cui_touch_released(ui, -7));
+        CHECK_NEAR(p.pos.x, -1e6f, 1.0f);
+    }
+
+    /* a move for a finger that is not down is dropped */
+    cui_input_touch_move(ui, 4, 9, 9);
+    {
+        touch_probe p = probe(ui, 4);
+        CHECK(!p.down);
+    }
+
+    /* the input hook sees touch events */
+    g_touch_hook_seen = 0;
+    cui_set_input_hook(ui, touch_hook, NULL);
+    cui_input_touch(ui, 0, true, 7, 8);
+    run(ui, build_empty, NULL, 1);
+    CHECK(g_touch_hook_seen == 1);
+    cui_input_touch_move(ui, 0, 8, 9);
+    run(ui, build_empty, NULL, 1);
+    CHECK(g_touch_hook_seen == 2);
+    cui_set_input_hook(ui, NULL, NULL);
+    cui_input_touch(ui, 0, false, 8, 9);
+    run(ui, build_empty, NULL, 1);
+
+    /* a consuming hook is offered down, move and up before legacy state */
+    touch_capture co = {0};
+    cui_set_input_hook(ui, touch_consume_hook, &co);
+    cui_input_touch(ui, 0, true, 10, 10);
+    cui_input_touch_move(ui, 0, 11, 12);
+    cui_input_touch(ui, 0, false, 11, 12);
+    CHECK(co.kinds[0] == CUI_INPUT_TOUCH && co.kinds[1] == CUI_INPUT_TOUCH_MOVE &&
+          co.kinds[2] == CUI_INPUT_TOUCH);
+    CHECK(co.count == 3);
+    cui_set_input_hook(ui, NULL, NULL);
+    {
+        touch_probe p = probe(ui, 0);
+        CHECK(!p.down);   /* consumed events never reached legacy state */
+    }
+
+    cui_destroy(ui);
+}
+
 /** Share one software renderer across the test contexts and return a failing
  * exit status to CTest if any check in the suite fails. */
 int main(void) {
     g_sw = cui_sw_create();
     test_color();
+    test_touch_api();
+    test_state_store_grow();
     test_layout_row();
     test_layout_wrap();
     test_layout_center();
@@ -7162,41 +10975,103 @@ int main(void) {
     test_layout_autogrid();
     test_layout_narrow_table();
     test_button_click();
+    test_button_hover_after_idle();
     test_click_then_keys();
     test_keyboard_nav();
     test_copy_button_focus();
+    test_nav_highlight();
+    test_clipboard_api();
+    test_clock_step_bound();
     test_toggles_and_slider();
     test_text_input();
+    test_disabled_password_reveal();
+    test_empty_field_caret();
     test_textarea_and_clear();
+    test_textarea_ime_caret();
+    test_nested_textarea_wheel();
+    test_scroll_reveal();
+    test_canvas_wheel();
+    test_image_update();
+    test_canvas_frame_alloc();
+    test_focus_scope();
+    test_focus_scope_canvas();
+    test_nested_focus();
+    test_nested_textarea_mixed_wheel();
+    test_canvas_rail_wheel();
+    test_number_edit_commit();
+    test_searchable_select_reopen();
     test_more_actions();
+    test_toggle_group_arrows();
+    test_dial_scope();
     test_more_inputs();
+    test_scrub_commit();
+    test_money_capacity();
+    test_range_slider_keyboard();
+    test_range_slider_context_menu();
     test_swipe();
+    test_scroll_swipe();
+    test_scroll_pickers();
     test_date_math();
     test_strings();
+    test_sql_colors();
+    test_calendar_years();
+    test_date_picker_reopens_on_days();
     test_pickers();
+    test_disabled_file_drop();
+#ifdef CUI_TEST_WINDOWS_IMAGE_PATH
+    test_windows_image_path();
+#endif
+    test_histogram_slider_bins();
+    test_ruler_bound();
+    test_picker_focus_ring();
+    test_color_picker_model_update();
+    test_picker_focus_keeps_content();
     test_disclosure();
+    test_expandable_focus();
+    test_palette_close();
+    test_confirm_popover_keyboard();
     test_checklist();
     test_data_grid();
+    test_json_tokens();
+    test_cell_text_before_row();
+    test_data_grid_shrinks();
+    test_data_grid_home_range();
+    test_table_focus();
+    test_filter_handoff();
     test_tree_table();
+    test_tree_table_drag();
+    test_tree_table_menu();
     test_tools();
     test_hex_view();
     test_markdown();
     test_code_editor();
+    test_code_editor_indented_text();
     test_diff();
     test_dials();
     test_candles();
+    test_disabled_candlestick_wheel();
     test_month();
     test_tour();
     test_photo();
+    test_wheel_in_moved_node();
     test_files();
+    test_fs_list_full_names();
     test_terminal();
     test_emoji();
     test_atlas_shrink();
+    test_atlas_wide_glyph();
     test_sw_incremental();
+    test_sw_texture_edges();
     test_emoji_release();
     test_planning();
+    test_read_only_plan_activation();
+    test_planning_drag_interrupted();
     test_node_editor();
+    test_disabled_node_editor_wheel();
     test_flame();
+    test_disabled_flame_wheel();
+    test_disabled_flame_shrinks();
+    test_disabled_timeline_wheel();
     test_curve_eval();
     test_curve_editor();
     test_gradient();
@@ -7204,23 +11079,44 @@ int main(void) {
     test_media();
     test_viz();
     test_motion();
+    test_typing_indicator_motion();
+    test_running_task_motion();
+    test_running_job_motion();
+    test_tab_step();
     test_ai();
     test_text_capacity();
     test_dialog();
+    test_dialog_escape_after_edit();
+    test_dialog_drag();
+    test_dialog_resize();
+    test_dialog_resize_footer_and_window();
     test_menu();
     test_focus_trap();
+    test_modal_popup_focus_trap();
+    test_tag_limit_batch();
     test_extras();
+    test_toast_deadline();
     test_reorder();
+    test_reorder_shrink();
     test_chrome();
     test_dock();
     test_virtual_list();
+    test_split_minimums();
     test_theme();
+    test_series_palette();
+    test_radial_gauge_styles();
+    test_treemap_select();
+    test_sankey_node_colors();
+    test_sankey_link_click();
+    test_gantt_state();
     test_renderer();
     test_scroll_fade();
     test_pretty_wrap();
     test_truncated_tooltip();
+    test_tooltip_hover_delay();
     test_truncated_tooltip_covered();
     test_number_roll();
+    test_long_number_roll();
     test_stress();
     test_atlas_pressure();
     cui_sw_destroy(g_sw);
