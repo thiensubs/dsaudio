@@ -40,7 +40,20 @@ jobs:
           echo "CMAKE_TOOLCHAIN_FILE=$env:RUNNER_TEMP\vcpkg\scripts\buildsystems\vcpkg.cmake" >> $env:GITHUB_ENV
 
       - name: Configure and build
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        shell: bash
+        run: |
+          args="-DCMAKE_BUILD_TYPE=Release"
+          case "${{ matrix.os }}" in
+            macos*)
+              # Without this the macOS 26 SDK floors the binary at 15.0 while
+              # Info.plist still claims 11.0, and every older Mac refuses to
+              # launch it with "you can't use this version of the application".
+              args="$args -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }}"
+              args="$args -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0"
+              ;;
+          esac
+          cmake -S . -B build $args
+          cmake --build build --config Release -j2
 
       - name: Build all targets
         run: cmake --build build --config Release -j2
@@ -48,10 +61,6 @@ jobs:
       # The release must not ship code that fails the tests.
       - name: Core tests
         run: ctest --test-dir build --output-on-failure -C Release
-
-      - name: macOS app bundle
-        if: startsWith(matrix.os, 'macos')
-        run: bash scripts/build_mac.sh Release
 
       - name: macOS app bundle
         if: startsWith(matrix.os, 'macos')
@@ -145,6 +154,21 @@ jobs:
           on Linux under Xvfb.
           EOF
 
+      # Each leg writes its own dist/SHA256SUMS, and identical file names collide
+      # when the artifacts merge, so the published one covered a single platform.
+      # Recompute it here from what actually shipped, and emit the per-asset
+      # sidecars install.sh and install.ps1 look for.
+      - name: Checksums
+        shell: bash
+        run: |
+          cd dist
+          rm -f SHA256SUMS *.sha256
+          sha256sum ./*.tar.gz ./*.zip > SHA256SUMS
+          for f in ./*.tar.gz ./*.zip; do
+            awk '{print $1}' <<< "$(sha256sum "$f")" > "$f.sha256"
+          done
+          cat SHA256SUMS
+
       - name: Publish
         uses: softprops/action-gh-release@v3
         with:
@@ -152,6 +176,7 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.zip
+            dist/*.sha256
             dist/SHA256SUMS
             scripts/install.sh
             scripts/install.ps1
