@@ -80,7 +80,7 @@ target_link_libraries(dsaudio-cli PRIVATE ds_core)
 # --- the CUI workbench -------------------------------------------------------
 add_executable(dsaudio
     src/app/main.c
-    src/app/fonts_cjk.c
+    src/app/fonts_fallback.c
     src/app/app_state.c
     src/app/ui_tts.c
     src/app/ui_asr.c
