@@ -41,7 +41,7 @@ and one for the client config.
 ![Settings view: key, endpoints, defaults and limits](docs/settings.png)
 
 Key and its store, base URL, output folder, default voice and format, timeouts,
-history size, waveform resolution and theme.
+history size, waveform resolution, theme and interface language.
 
 ## Build
 
@@ -62,15 +62,15 @@ first frame macOS lists; the rest are wall-clock.
 
 | Application | Binary | Size | Time |
 |---|---|---|---|
-| `dsaudio` (workbench) | `build/dsaudio` | 2,326,880 B (2.2 MiB) | 4.95 s to a visible window |
-| `dsaudio-cli` | `build/dsaudio-cli` | 1,274,304 B (1.2 MiB) | 0.55 s for `config` |
-| `dsaudio-mcp` | `build/dsaudio-mcp` | 1,273,936 B (1.2 MiB) | 0.51 s for `--selftest` |
+| `dsaudio` (workbench) | `build/dsaudio` | 2,368,352 B (2.3 MiB) | 4.74 s to a visible window |
+| `dsaudio-cli` | `build/dsaudio-cli` | 1,320,056 B (1.3 MiB) | 0.63 s for `config` |
+| `dsaudio-mcp` | `build/dsaudio-mcp` | 1,319,680 B (1.3 MiB) | 0.55 s for `--selftest` |
 | TTS, 2 chunks, cold cache | – | 5.09 s | 2 requests, 0 from cache |
 | TTS, same text, warm cache | – | **0.60 s** | 0 requests, no token cost |
 | TTS, one sentence edited | – | 1.75 s | 1 request, 1 chunk reused |
 | ASR, 3 s clip | – | 1.94 s | 1 request |
 
-The 4.95 s window is dominated by parsing the embedded fonts: our four fallback
+The 4.74 s window is dominated by parsing the embedded fonts: our four fallback
 subsets (Vietnamese 161 KB, Chinese 164 KB, Japanese 224 KB, Korean 174 KB) plus
 the faces CUI ships. Lazy-loading the CJK subsets only when a CJK
 language is selected is the obvious next win.
@@ -119,6 +119,18 @@ The key is resolved in this order:
    read only, never written back
 
 `dsaudio-cli config` prints which of these is in force.
+
+## Interface language
+
+The workbench is translated into English, Vietnamese, Chinese, Japanese, Korean,
+Spanish, French and German. On first launch it follows the machine: macOS and
+Windows read the system's preferred language, Linux reads `LC_ALL`, then
+`LC_MESSAGES`, then `LANG`. A locale outside those eight falls back to English.
+Choose another under Settings and save — it applies at once and is stored in the
+app's config file.
+
+Status lines that carry numbers or paths (byte counts, timings, file names) stay
+English, as do the CLI and MCP output.
 
 ## Install the MCP server
 
