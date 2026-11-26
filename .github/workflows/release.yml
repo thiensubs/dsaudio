@@ -163,7 +163,7 @@ jobs:
         run: |
           cd dist
           rm -f SHA256SUMS *.sha256
-          sha256sum ./*.tar.gz ./*.zip > SHA256SUMS
+          sha256sum *.tar.gz *.zip > SHA256SUMS
           for f in ./*.tar.gz ./*.zip; do
             awk '{print $1}' <<< "$(sha256sum "$f")" > "$f.sha256"
           done
